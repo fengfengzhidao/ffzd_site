@@ -1,0 +1,9 @@
+/data/
+/uploads/
+/*.exe
+/*.exe~
+/.env
+/*.log
+/*.pid
+/.tmp-validation/
+/midscene_run/

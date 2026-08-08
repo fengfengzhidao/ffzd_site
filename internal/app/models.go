@@ -1,0 +1,40 @@
+package app
+
+import "time"
+
+type Post struct {
+	ID                                           int64
+	Title, Slug, Summary, Markdown, HTML, Status string
+	CategoryID                                   *int64
+	CategoryName, CategorySlug                   string
+	Tags                                         []Tag
+	PublishedAt                                  *time.Time
+	CreatedAt, UpdatedAt                         time.Time
+}
+
+type Category struct {
+	ID         int64
+	Name, Slug string
+	Count      int
+}
+type Tag struct {
+	ID         int64
+	Name, Slug string
+	Count      int
+}
+type Admin struct {
+	ID       int64
+	Username string
+}
+type Session struct {
+	AdminID        int64
+	Username, CSRF string
+	ExpiresAt      time.Time
+}
+
+type Settings struct {
+	SiteTitle, Tagline, Description, Author, SiteURL, SEOKeywords, FooterText, SiteIcon string
+	PostsPerPage                                                                        int
+}
+
+type DashboardStats struct{ Total, Drafts, Published int }
