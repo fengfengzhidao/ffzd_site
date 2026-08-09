@@ -1,0 +1,9 @@
+CREATE TABLE covers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  url TEXT NOT NULL UNIQUE,
+  source TEXT NOT NULL CHECK(source IN ('upload','external')),
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE posts ADD COLUMN cover_id INTEGER REFERENCES covers(id) ON DELETE SET NULL;
+CREATE INDEX idx_posts_cover ON posts(cover_id);

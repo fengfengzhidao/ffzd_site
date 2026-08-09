@@ -8,9 +8,18 @@ type Post struct {
 	IsVisible                                              bool
 	CategoryID                                             *int64
 	CategoryName, CategorySlug                             string
+	CoverID                                                *int64
+	CoverURL                                               string
 	Tags                                                   []Tag
 	PublishedAt                                            *time.Time
 	CreatedAt, UpdatedAt                                   time.Time
+}
+
+type Cover struct {
+	ID        int64
+	URL       string
+	Source    string
+	CreatedAt time.Time
 }
 
 type Category struct {

@@ -196,22 +196,28 @@ func scanPost(row interface{ Scan(...any) error }) (Post, error) {
 	var p Post
 	var catID sql.NullInt64
 	var catName, catSlug sql.NullString
+	var coverID sql.NullInt64
+	var coverURL sql.NullString
 	var pub sql.NullTime
 	var visible int
-	err := row.Scan(&p.ID, &p.Title, &p.Slug, &p.Summary, &p.Keywords, &p.Markdown, &p.HTML, &p.Status, &visible, &catID, &catName, &catSlug, &pub, &p.CreatedAt, &p.UpdatedAt)
+	err := row.Scan(&p.ID, &p.Title, &p.Slug, &p.Summary, &p.Keywords, &p.Markdown, &p.HTML, &p.Status, &visible, &catID, &catName, &catSlug, &coverID, &coverURL, &pub, &p.CreatedAt, &p.UpdatedAt)
 	p.IsVisible = visible == 1
 	if catID.Valid {
 		p.CategoryID = &catID.Int64
 	}
 	p.CategoryName = catName.String
 	p.CategorySlug = catSlug.String
+	if coverID.Valid {
+		p.CoverID = &coverID.Int64
+	}
+	p.CoverURL = coverURL.String
 	if pub.Valid {
 		p.PublishedAt = &pub.Time
 	}
 	return p, err
 }
 
-const postSelect = `SELECT p.id,p.title,p.slug,p.summary,p.keywords,p.markdown,p.html,p.status,p.is_visible,p.category_id,c.name,c.slug,p.published_at,p.created_at,p.updated_at FROM posts p LEFT JOIN categories c ON c.id=p.category_id`
+const postSelect = `SELECT p.id,p.title,p.slug,p.summary,p.keywords,p.markdown,p.html,p.status,p.is_visible,p.category_id,c.name,c.slug,p.cover_id,cv.url,p.published_at,p.created_at,p.updated_at FROM posts p LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN covers cv ON cv.id=p.cover_id`
 
 func (s *Store) PostByID(id int64) (Post, error) {
 	p, e := scanPost(s.DB.QueryRow(postSelect+" WHERE p.id=?", id))
@@ -409,14 +415,23 @@ func savePostTx(tx *sql.Tx, p *Post, tagIDs []int64) error {
 		p.PublishedAt = &now
 		pub = now
 	}
+	if p.CoverID == nil {
+		var coverID sql.NullInt64
+		if err := tx.QueryRow("SELECT id FROM covers ORDER BY random() LIMIT 1").Scan(&coverID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if coverID.Valid {
+			p.CoverID = &coverID.Int64
+		}
+	}
 	if p.ID == 0 {
-		r, e := tx.Exec(`INSERT INTO posts(title,slug,summary,keywords,markdown,html,status,is_visible,category_id,published_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, p.Title, p.Slug, p.Summary, p.Keywords, p.Markdown, p.HTML, p.Status, p.IsVisible, p.CategoryID, pub, time.Now())
+		r, e := tx.Exec(`INSERT INTO posts(title,slug,summary,keywords,markdown,html,status,is_visible,category_id,cover_id,published_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, p.Title, p.Slug, p.Summary, p.Keywords, p.Markdown, p.HTML, p.Status, p.IsVisible, p.CategoryID, p.CoverID, pub, time.Now())
 		if e != nil {
 			return e
 		}
 		p.ID, _ = r.LastInsertId()
 	} else {
-		_, err := tx.Exec(`UPDATE posts SET title=?,slug=?,summary=?,keywords=?,markdown=?,html=?,status=?,is_visible=?,category_id=?,published_at=?,updated_at=? WHERE id=?`, p.Title, p.Slug, p.Summary, p.Keywords, p.Markdown, p.HTML, p.Status, p.IsVisible, p.CategoryID, pub, time.Now(), p.ID)
+		_, err := tx.Exec(`UPDATE posts SET title=?,slug=?,summary=?,keywords=?,markdown=?,html=?,status=?,is_visible=?,category_id=?,cover_id=?,published_at=?,updated_at=? WHERE id=?`, p.Title, p.Slug, p.Summary, p.Keywords, p.Markdown, p.HTML, p.Status, p.IsVisible, p.CategoryID, p.CoverID, pub, time.Now(), p.ID)
 		if err != nil {
 			return err
 		}
@@ -430,6 +445,92 @@ func savePostTx(tx *sql.Tx, p *Post, tagIDs []int64) error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) Covers() ([]Cover, error) {
+	rows, err := s.DB.Query("SELECT id,url,source,created_at FROM covers ORDER BY created_at DESC,id DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var covers []Cover
+	for rows.Next() {
+		var cover Cover
+		if err := rows.Scan(&cover.ID, &cover.URL, &cover.Source, &cover.CreatedAt); err != nil {
+			return nil, err
+		}
+		covers = append(covers, cover)
+	}
+	return covers, rows.Err()
+}
+
+func (s *Store) AddCover(url, source string) (Cover, error) {
+	var cover Cover
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return cover, err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec("INSERT INTO covers(url,source) VALUES(?,?)", url, source)
+	if err != nil {
+		return cover, err
+	}
+	cover.ID, err = result.LastInsertId()
+	if err != nil {
+		return cover, err
+	}
+	// When the first covers are added after upgrading, give legacy articles a
+	// cover as well. Editors can still randomize each article from the list.
+	if _, err = tx.Exec("UPDATE posts SET cover_id=(SELECT id FROM covers ORDER BY random() LIMIT 1) WHERE cover_id IS NULL"); err != nil {
+		return cover, err
+	}
+	if err = tx.Commit(); err != nil {
+		return cover, err
+	}
+	cover.URL = url
+	cover.Source = source
+	cover.CreatedAt = time.Now()
+	return cover, nil
+}
+
+func (s *Store) DeleteCover(id int64) error {
+	result, err := s.DB.Exec("DELETE FROM covers WHERE id=?", id)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) RandomizePostCover(id int64) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current sql.NullInt64
+	if err := tx.QueryRow("SELECT cover_id FROM posts WHERE id=?", id).Scan(&current); err != nil {
+		return err
+	}
+	var next int64
+	err = tx.QueryRow("SELECT id FROM covers WHERE id<>? ORDER BY random() LIMIT 1", current.Int64).Scan(&next)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = tx.QueryRow("SELECT id FROM covers ORDER BY random() LIMIT 1").Scan(&next)
+	}
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errors.New("请先添加至少一张文章封面")
+		}
+		return err
+	}
+	if _, err = tx.Exec("UPDATE posts SET cover_id=?,updated_at=? WHERE id=?", next, time.Now(), id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) DeletePost(id int64) error {
 	_, err := s.DB.Exec("DELETE FROM posts WHERE id=?", id)

@@ -44,7 +44,7 @@ func TestStoreAdminSessionAndMigration(t *testing.T) {
 		t.Fatalf("deleted session remains: %v", err)
 	}
 	var versions int
-	if err = s.DB.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 4 {
+	if err = s.DB.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 5 {
 		t.Fatalf("migration tracking failed: %d %v", versions, err)
 	}
 }
@@ -186,5 +186,42 @@ func TestSavePostWithInlineTaxonomiesIsAtomic(t *testing.T) {
 	}
 	if err := s.DB.QueryRow("SELECT COUNT(*) FROM posts WHERE slug='rollback-taxonomies'").Scan(&count); err != nil || count != 0 {
 		t.Fatalf("post was not rolled back: %d %v", count, err)
+	}
+}
+
+func TestCoverRandomAssignmentAndDeletion(t *testing.T) {
+	s := newTestStore(t)
+	post := &Post{Title: "封面文章", Slug: "cover-post", Markdown: "正文", HTML: "<p>正文</p>", Status: "published", IsVisible: true}
+	if err := s.SavePost(post, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddCover("/uploads/cover-a.webp", "upload"); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := s.PostByID(post.ID)
+	if err != nil || legacy.CoverID == nil {
+		t.Fatalf("adding the first cover should backfill legacy articles: %#v %v", legacy, err)
+	}
+	if _, err := s.AddCover("https://example.com/cover-b.jpg", "external"); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := s.PostByID(post.ID)
+	if err != nil || saved.CoverID == nil || saved.CoverURL == "" {
+		t.Fatalf("random cover was not assigned: %#v %v", saved, err)
+	}
+	firstID := *saved.CoverID
+	if err = s.RandomizePostCover(post.ID); err != nil {
+		t.Fatal(err)
+	}
+	saved, err = s.PostByID(post.ID)
+	if err != nil || saved.CoverID == nil || *saved.CoverID == firstID {
+		t.Fatalf("cover was not changed when an alternative existed: %#v %v", saved, err)
+	}
+	if err = s.DeleteCover(*saved.CoverID); err != nil {
+		t.Fatal(err)
+	}
+	saved, err = s.PostByID(post.ID)
+	if err != nil || saved.CoverID != nil || saved.CoverURL != "" {
+		t.Fatalf("deleting a cover should clear the article relation: %#v %v", saved, err)
 	}
 }

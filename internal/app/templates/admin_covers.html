@@ -1,0 +1,19 @@
+{{define "cover_upload_dialog"}}
+<div class="cover-upload-dialog" data-cover-upload-dialog hidden>
+  <button class="cover-upload-backdrop" type="button" data-cover-upload-close aria-label="关闭上传封面弹窗"></button>
+  <section class="cover-upload-panel" role="dialog" aria-modal="true" aria-labelledby="cover-upload-title">
+    <header><div><p class="eyebrow">图片素材</p><h2 id="cover-upload-title">上传封面</h2></div><button type="button" data-cover-upload-close aria-label="关闭">×</button></header>
+    <form method="post" action="/admin/covers" enctype="multipart/form-data" data-cover-upload-form data-cover-upload-mode="{{if eq .CurrentPath "/admin/posts"}}article{{else}}library{{end}}">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <label class="cover-drop-zone" data-cover-drop-zone tabindex="0"><span class="cover-drop-copy" data-cover-drop-copy><strong>选择图片或粘贴图片</strong><span>点击选择文件，或聚焦此区域后按 Ctrl+V</span></span><input type="file" name="image" accept="image/png,image/jpeg,image/gif,image/webp" data-cover-file hidden><img alt="待上传封面预览" data-cover-preview hidden><span class="cover-preview-loading" data-cover-preview-loading hidden>正在加载预览…</span></label>
+      <div class="cover-upload-divider"><span>或者</span></div>
+      <label>图片 URL<input type="url" name="external_url" maxlength="2048" placeholder="https://example.com/cover.webp" data-cover-url></label>
+      <p class="field-help">支持 PNG、JPEG、GIF、WebP，最大 10 MB；也可使用 HTTP/HTTPS 图片链接。</p>
+      <p class="field-error cover-upload-error" data-cover-upload-error hidden></p>
+      <footer><button class="button secondary" type="button" data-cover-upload-close>取消</button><button class="button" type="submit" data-cover-upload-submit>上传封面</button></footer>
+    </form>
+  </section>
+</div>
+{{end}}
+
+{{define "admin_covers.html"}}{{template "head" .}}<div class="admin-layout" data-admin-layout>{{template "admin_sidebar" .}}<div class="admin-workspace">{{template "admin_topbar" .}}<main class="container admin-page"><header class="section-head cover-page-title"><div><p class="eyebrow">内容素材</p><h1>文章封面</h1></div><button class="button" type="button" data-cover-upload-open>上传封面</button></header>{{if .Flash}}<div class="alert success" role="status">{{.Flash}}</div>{{end}}{{if .Error}}<div class="alert" role="alert">{{.Error}}</div>{{end}}<section class="cover-library" aria-label="封面列表">{{if .Covers}}<div class="cover-grid">{{range .Covers}}<article class="cover-item"><img src="{{.URL}}" alt="文章封面" loading="lazy"><time class="cover-time">{{formatTime .CreatedAt}}</time><form method="post" action="/admin/covers/{{.ID}}/delete" data-confirm="确定从封面库移除这张图片吗？已上传的原文件不会删除。"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="cover-remove" type="submit" aria-label="移除这张封面" title="移除封面">×</button></form></article>{{end}}</div>{{else}}<div class="empty panel">封面库还是空的，点击“上传封面”添加第一张图片。</div>{{end}}</section></main></div>{{template "admin_overlay" .}}</div>{{template "cover_upload_dialog" .}}<script src="/static/app.js?v=20260809-cover2" defer></script></body></html>{{end}}

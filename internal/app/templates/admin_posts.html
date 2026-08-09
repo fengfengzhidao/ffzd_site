@@ -1,5 +1,5 @@
 {{define "admin_post_table"}}
-{{if .Posts}}<div class="table-wrap"><table class="post-admin-table"><thead><tr><th>标题</th><th>可见性</th><th>分类</th><th>更新时间</th><th></th></tr></thead><tbody>{{range .Posts}}<tr><td><a href="/admin/posts?compose={{.ID}}">{{.Title}}</a><small>/{{postPath .}}</small></td><td><form method="post" action="/admin/posts/{{.ID}}/visibility" class="visibility-form"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" name="is_visible" value="{{if .IsVisible}}0{{else}}1{{end}}" class="visibility-toggle{{if .IsVisible}} is-on{{end}}" role="switch" aria-checked="{{.IsVisible}}" aria-label="切换《{{.Title}}》的可见性"><span aria-hidden="true"></span><em>{{if .IsVisible}}可见{{else}}隐藏{{end}}</em></button></form></td><td>{{if .CategoryName}}{{.CategoryName}}{{else}}未分类{{end}}</td><td>{{formatTime .UpdatedAt}}</td><td><a href="/admin/posts?compose={{.ID}}">编辑</a></td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty">还没有文章。</div>{{end}}
+{{if .Posts}}<div class="table-wrap"><table class="post-admin-table"><thead><tr><th>封面</th><th>标题</th><th>可见性</th><th>分类</th><th>更新时间</th><th></th></tr></thead><tbody>{{range .Posts}}<tr><td><div class="admin-post-cover">{{if .CoverURL}}<img src="{{.CoverURL}}" alt="《{{.Title}}》封面" loading="lazy">{{else}}<span>暂无封面</span>{{end}}</div></td><td><a href="/posts/{{postPath .}}">{{.Title}}</a><small>/{{postPath .}}</small></td><td><form method="post" action="/admin/posts/{{.ID}}/visibility" class="visibility-form"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" name="is_visible" value="{{if .IsVisible}}0{{else}}1{{end}}" class="visibility-toggle{{if .IsVisible}} is-on{{end}}" role="switch" aria-checked="{{.IsVisible}}" aria-label="切换《{{.Title}}》的可见性"><span aria-hidden="true"></span><em>{{if .IsVisible}}可见{{else}}隐藏{{end}}</em></button></form></td><td>{{if .CategoryName}}{{.CategoryName}}{{else}}未分类{{end}}</td><td>{{formatTime .UpdatedAt}}</td><td><div class="post-row-actions"><a class="button secondary" href="/admin/posts?compose={{.ID}}&amp;info=1">基本信息</a><a href="/admin/posts?compose={{.ID}}">编辑</a><form method="post" action="/admin/posts/{{.ID}}/random-cover"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="link-button" type="submit">换封面</button></form></div></td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty">还没有文章。</div>{{end}}
 {{end}}
 
 {{define "post_composer"}}
@@ -22,11 +22,11 @@
         <button type="button" data-md-wrap="`" title="行内代码">&lt;/&gt;</button>
         <button type="button" data-md-link title="链接">🔗</button>
         <label class="editor-upload" title="上传图片">▧<input id="image-upload" type="file" accept="image/png,image/jpeg,image/gif,image/webp" hidden></label>
-        <span id="upload-status" class="editor-upload-status">支持 Markdown，图片上传后自动插入</span>
+        <span id="upload-status" class="editor-upload-status" role="status" aria-live="polite">支持 Markdown，可粘贴或选择图片上传</span>
       </div>
       <div class="composer-editor">
         <label class="sr-only" for="markdown-input">Markdown 正文</label>
-        <textarea id="markdown-input" name="markdown" data-csrf="{{.CSRF}}" placeholder="开始写作……" autofocus>{{.Post.Markdown}}</textarea>
+        <textarea id="markdown-input" name="markdown" data-csrf="{{.CSRF}}" placeholder="开始写作……" {{if not .InfoOpen}}autofocus{{end}}>{{.Post.Markdown}}</textarea>
         <section class="composer-live-preview" aria-label="文章实时预览"><div id="markdown-preview" class="markdown-body"></div></section>
       </div>
       <footer class="composer-footer composer-main-footer">
@@ -38,15 +38,16 @@
         </div>
       </footer>
 
-      <div class="post-info-layer" data-info-layer aria-hidden="true">
+      <div class="post-info-layer{{if .InfoOpen}} is-open{{end}}" data-info-layer data-info-direct="{{.InfoOpen}}" aria-hidden="{{if .InfoOpen}}false{{else}}true{{end}}">
         <button class="post-info-backdrop" type="button" data-info-close aria-label="关闭文章信息"></button>
         <section class="post-info-dialog" role="dialog" aria-modal="true" aria-labelledby="post-info-title">
-          <header><h3 id="post-info-title">文章信息</h3><button type="button" data-info-close aria-label="关闭">×</button></header>
+          <header><h3 id="post-info-title">{{if .InfoOpen}}编辑文章基本信息{{else}}文章信息{{end}}</h3><button type="button" data-info-close aria-label="关闭">×</button></header>
           <div class="post-info-body">
             <p class="field-error" data-info-error hidden>请填写文章标题</p>
             <label class="post-info-field"><span class="field-label">文章标题 <i aria-hidden="true">*</i></span><input name="title" value="{{.Post.Title}}" maxlength="200" placeholder="请输入文章标题"></label>
             <label class="post-info-field"><span class="field-label">文章简介</span><textarea name="summary" rows="4" maxlength="500" placeholder="不填写时，自动取正文前 60 个字符">{{.Post.Summary}}</textarea><small>留空将自动从正文提取 60 个字符</small></label>
             <label class="post-info-field"><span class="field-label">关键词</span><input name="keywords" value="{{.Post.Keywords}}" maxlength="300" placeholder="多个关键词可用逗号分隔"></label>
+            <fieldset class="post-info-field post-cover-field"><legend class="field-label">文章封面</legend><div class="post-cover-picker"><div class="post-cover-current" data-current-cover>{{if .Post.CoverURL}}<img src="{{.Post.CoverURL}}" alt="当前文章封面" data-current-cover-image>{{else}}<span data-current-cover-empty>暂无封面</span><img alt="当前文章封面" data-current-cover-image hidden>{{end}}</div><div class="post-cover-actions"><button class="button secondary" type="button" data-cover-select-open>选择封面</button><button class="button secondary" type="button" data-cover-upload-open>上传新封面</button></div><small>{{if .Covers}}可从封面库选择，或上传一张新封面。{{else}}封面库为空，请先上传一张封面。{{end}}</small></div></fieldset>
             <label class="post-info-field"><span class="field-label">文章分类</span><input name="category_name" list="category-options" value="{{.Post.CategoryName}}" maxlength="80" placeholder="输入或选择分类"><datalist id="category-options">{{range .Categories}}<option value="{{.Name}}">{{end}}</datalist></label>
             <label class="post-info-field"><span class="field-label">文章标签</span><div class="tag-combobox" data-tag-combobox data-initial-tags="{{tagNames .Post.Tags}}"><div class="tag-values" data-tag-values></div><input type="text" list="tag-options" data-tag-input placeholder="输入标签，按回车或逗号添加" autocomplete="off"><input type="hidden" name="new_tags" data-tag-hidden value="{{tagNames .Post.Tags}}"></div><datalist id="tag-options">{{range .Tags}}<option value="{{.Name}}">{{end}}</datalist></label>
             <label class="visibility-choice"><input type="checkbox" name="is_visible" value="1" {{if .Post.IsVisible}}checked{{end}}><span><strong>文章可见</strong><small>关闭后文章仍会保存，但不会在前台显示</small></span></label>
@@ -55,15 +56,23 @@
             {{if .Post.ID}}<button class="danger" type="submit" form="delete-post-form">永久删除</button>{{end}}
             <span class="info-footer-spacer"></span>
             <button type="button" class="button secondary" data-info-close>取消</button>
-            <button type="button" class="button" data-info-save>确定</button>
-            <button type="submit" class="button info-publish" data-info-publish>直接发布</button>
+            {{if .InfoOpen}}<button type="submit" class="button" data-info-direct-save>保存基本信息</button>{{else}}<button type="button" class="button" data-info-save>确定</button><button type="submit" class="button info-publish" data-info-publish>直接发布</button>{{end}}
           </footer>
+        </section>
+      </div>
+      <div class="cover-select-layer" data-cover-select-layer aria-hidden="true">
+        <button class="cover-select-backdrop" type="button" data-cover-select-cancel aria-label="取消选择封面"></button>
+        <section class="cover-select-dialog" role="dialog" aria-modal="true" aria-labelledby="cover-select-title">
+          <header><div><p class="eyebrow">封面库</p><h3 id="cover-select-title">选择文章封面</h3></div><button type="button" data-cover-select-cancel aria-label="关闭">×</button></header>
+          <div class="cover-select-body">{{if not .Covers}}<div class="cover-select-empty" data-cover-select-empty>封面库为空，请上传第一张封面。</div>{{end}}<div class="post-cover-options" data-post-cover-options>{{range .Covers}}<label class="post-cover-choice"><input type="radio" name="cover_id" value="{{.ID}}" {{if coverSelected .ID $.Post.CoverID}}checked{{end}}><span><img src="{{.URL}}" alt="" loading="lazy"></span></label>{{end}}</div></div>
+          <footer><button class="button secondary" type="button" data-cover-upload-open>上传新封面</button><span></span><button class="button secondary" type="button" data-cover-select-cancel>取消</button><button class="button" type="button" data-cover-select-confirm>确认选择</button></footer>
         </section>
       </div>
     </form>
     {{if .Post.ID}}<form id="delete-post-form" method="post" action="/admin/posts/{{.Post.ID}}/delete" data-confirm="确定永久删除这篇文章吗？图片文件不会自动删除。"><input type="hidden" name="csrf" value="{{.CSRF}}"></form>{{end}}
   </aside>
 </div>
+{{template "cover_upload_dialog" .}}
 {{end}}
 
-{{define "admin_posts.html"}}{{template "head" .}}<div class="admin-layout" data-admin-layout>{{template "admin_sidebar" .}}<div class="admin-workspace">{{template "admin_topbar" .}}<main class="container admin-page"><div class="section-head"><div><p class="eyebrow">内容</p><h1>文章管理</h1></div><a class="button" href="/admin/posts?compose=new" data-new-composer>发布文章</a></div>{{if .Flash}}<div class="alert success" role="status">{{.Flash}}</div>{{end}}<section class="panel">{{template "admin_post_table" .}}</section></main></div>{{template "admin_overlay" .}}</div>{{template "post_composer" .}}<script src="/static/app.js" defer></script></body></html>{{end}}
+{{define "admin_posts.html"}}{{template "head" .}}<div class="admin-layout" data-admin-layout>{{template "admin_sidebar" .}}<div class="admin-workspace">{{template "admin_topbar" .}}<main class="container admin-page"><div class="section-head"><div><p class="eyebrow">内容</p><h1>文章管理</h1></div><a class="button" href="/admin/posts?compose=new" data-new-composer>发布文章</a></div>{{if .Flash}}<div class="alert success" role="status">{{.Flash}}</div>{{end}}{{if .Error}}<div class="alert" role="alert">{{.Error}}</div>{{end}}<section class="panel">{{template "admin_post_table" .}}</section></main></div>{{template "admin_overlay" .}}</div>{{template "post_composer" .}}<script src="/static/app.js" defer></script></body></html>{{end}}

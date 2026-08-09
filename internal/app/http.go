@@ -48,13 +48,14 @@ type viewData struct {
 	Admin                                                         *Session
 	Post                                                          *Post
 	Posts                                                         []Post
+	Covers                                                        []Cover
 	Categories                                                    []Category
 	Tags                                                          []Tag
 	Stats                                                         DashboardStats
 	Page, TotalPages                                              int
 	Now                                                           time.Time
 	JSONLD                                                        template.JS
-	ComposerOpen                                                  bool
+	ComposerOpen, InfoOpen                                        bool
 }
 
 type contextKey string
@@ -80,6 +81,9 @@ func New(cfg Config) (*App, error) {
 		"formatTime": func(t time.Time) string { return t.Local().Format("2006-01-02 15:04") },
 		"safeHTML":   func(s string) template.HTML { return template.HTML(s) },
 		"postPath":   PublicPostPath,
+		"coverSelected": func(id int64, selected *int64) bool {
+			return selected != nil && id == *selected
+		},
 		"tagNames": func(tags []Tag) string {
 			names := make([]string, 0, len(tags))
 			for _, tag := range tags {
@@ -124,7 +128,11 @@ func (a *App) routes() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, a.securityHeaders)
 	staticFS, _ := fs.Sub(webFS, "static")
-	r.Handle("/static/*", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+	staticHandler := http.StripPrefix("/static/", http.FileServer(http.FS(staticFS)))
+	r.Handle("/static/*", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		staticHandler.ServeHTTP(w, r)
+	}))
 	r.Handle("/uploads/*", http.StripPrefix("/uploads/", http.FileServer(http.Dir(a.cfg.UploadDir))))
 	r.Get("/", a.home)
 	r.Get("/posts", a.posts)
@@ -146,7 +154,11 @@ func (a *App) routes() http.Handler {
 			r.Get("/posts/{id}", a.editPostPage)
 			r.Post("/posts/{id}", a.savePost)
 			r.Post("/posts/{id}/visibility", a.togglePostVisibility)
+			r.Post("/posts/{id}/random-cover", a.randomizePostCover)
 			r.Post("/posts/{id}/delete", a.deletePost)
+			r.Get("/covers", a.coversPage)
+			r.Post("/covers", a.addCover)
+			r.Post("/covers/{id}/delete", a.deleteCover)
 			r.Post("/preview", a.preview)
 			r.Post("/upload", a.upload)
 			r.Get("/settings", a.settingsPage)
@@ -162,7 +174,7 @@ func (a *App) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; form-action 'self'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob: http: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; form-action 'self'; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -375,10 +387,14 @@ func (a *App) adminPosts(w http.ResponseWriter, r *http.Request) {
 	d.Posts, _, _ = a.store.ListPosts(r.Context(), false, "", "", 1, 100)
 	d.Categories, _ = a.store.Categories()
 	d.Tags, _ = a.store.Tags()
+	d.Covers, _ = a.store.Covers()
 	d.Post = &Post{Status: "published", IsVisible: true}
 	if r.URL.Query().Get("saved") == "1" {
 		d.Flash = "文章已保存"
+	} else if r.URL.Query().Get("cover_changed") == "1" {
+		d.Flash = "文章封面已随机更换"
 	}
+	d.Error = r.URL.Query().Get("cover_error")
 	if compose := r.URL.Query().Get("compose"); compose != "" {
 		d.ComposerOpen = true
 		if id, _ := strconv.ParseInt(compose, 10, 64); id > 0 {
@@ -388,6 +404,7 @@ func (a *App) adminPosts(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			d.Post = &p
+			d.InfoOpen = r.URL.Query().Get("info") == "1"
 		}
 	}
 	a.render(w, r, "admin_posts.html", d, 200)
@@ -428,7 +445,19 @@ func (a *App) savePost(w http.ResponseWriter, r *http.Request) {
 	if summary == "" {
 		summary = PlainTextSummary(html, 60)
 	}
-	p := Post{ID: id, Title: title, Slug: slug, Summary: summary, Keywords: keywords, Markdown: r.FormValue("markdown"), HTML: html, Status: "published", IsVisible: r.FormValue("is_visible") == "1", PublishedAt: old.PublishedAt}
+	coverID := old.CoverID
+	if values, present := r.Form["cover_id"]; present {
+		coverID = nil
+		if raw := strings.TrimSpace(values[0]); raw != "" {
+			parsed, parseErr := strconv.ParseInt(raw, 10, 64)
+			if parseErr != nil || parsed <= 0 {
+				http.Error(w, "请选择有效的文章封面", http.StatusBadRequest)
+				return
+			}
+			coverID = &parsed
+		}
+	}
+	p := Post{ID: id, Title: title, Slug: slug, Summary: summary, Keywords: keywords, Markdown: r.FormValue("markdown"), HTML: html, Status: "published", IsVisible: r.FormValue("is_visible") == "1", CoverID: coverID, PublishedAt: old.PublishedAt}
 	newCategory := strings.TrimSpace(r.FormValue("category_name"))
 	if utf8.RuneCountInString(newCategory) > 80 {
 		http.Error(w, "新分类名称不能超过 80 个字符", 400)
@@ -461,6 +490,19 @@ func (a *App) togglePostVisibility(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/admin/posts", http.StatusSeeOther)
+}
+
+func (a *App) randomizePostCover(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if id <= 0 {
+		http.Error(w, "无效文章", http.StatusBadRequest)
+		return
+	}
+	if err := a.store.RandomizePostCover(id); err != nil {
+		http.Redirect(w, r, "/admin/posts?cover_error="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/admin/posts?cover_changed=1", http.StatusSeeOther)
 }
 
 func parseNewTagNames(raw string) ([]string, error) {
@@ -526,6 +568,87 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"url": path})
+}
+
+func (a *App) coversPage(w http.ResponseWriter, r *http.Request) {
+	d := a.baseData(r, "文章封面", "")
+	d.Covers, _ = a.store.Covers()
+	switch {
+	case r.URL.Query().Get("saved") == "1":
+		d.Flash = "封面已添加"
+	case r.URL.Query().Get("deleted") == "1":
+		d.Flash = "封面记录已移除，已上传文件仍保留"
+	}
+	d.Error = r.URL.Query().Get("error")
+	a.render(w, r, "admin_covers.html", d, http.StatusOK)
+}
+
+func (a *App) addCover(w http.ResponseWriter, r *http.Request) {
+	source := ""
+	var coverURL string
+	var err error
+	var file multipart.File
+	var header *multipart.FileHeader
+	fileErr := http.ErrMissingFile
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		file, header, fileErr = r.FormFile("image")
+	}
+	switch {
+	case fileErr == nil:
+		source = "upload"
+		defer file.Close()
+		coverURL, err = a.saveImage(file, header)
+	case errors.Is(fileErr, http.ErrMissingFile) && strings.TrimSpace(r.FormValue("external_url")) != "":
+		source = "external"
+		coverURL, err = validateExternalImageURL(r.FormValue("external_url"))
+	case !errors.Is(fileErr, http.ErrMissingFile):
+		err = errors.New("图片上传失败")
+	default:
+		err = errors.New("请选择图片、粘贴剪贴板图片，或填写图片 URL")
+	}
+	var cover Cover
+	if err == nil {
+		cover, err = a.store.AddCover(coverURL, source)
+	}
+	if err != nil {
+		if strings.Contains(r.Header.Get("Accept"), "application/json") {
+			http.Error(w, "添加失败："+err.Error(), http.StatusBadRequest)
+			return
+		}
+		http.Redirect(w, r, "/admin/covers?error="+url.QueryEscape("添加失败："+err.Error()), http.StatusSeeOther)
+		return
+	}
+	if strings.Contains(r.Header.Get("Accept"), "application/json") {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(cover)
+		return
+	}
+	http.Redirect(w, r, "/admin/covers?saved=1", http.StatusSeeOther)
+}
+
+func validateExternalImageURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) > 2048 {
+		return "", errors.New("外部链接不能超过 2048 个字符")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil {
+		return "", errors.New("请输入有效的 HTTP 或 HTTPS 图片链接")
+	}
+	return parsed.String(), nil
+}
+
+func (a *App) deleteCover(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if id <= 0 {
+		http.Error(w, "无效封面", http.StatusBadRequest)
+		return
+	}
+	if err := a.store.DeleteCover(id); err != nil {
+		http.Redirect(w, r, "/admin/covers?error="+url.QueryEscape("移除失败："+err.Error()), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/admin/covers?deleted=1", http.StatusSeeOther)
 }
 func (a *App) saveImage(file multipart.File, header *multipart.FileHeader) (string, error) {
 	const maxImageSize int64 = 10 << 20

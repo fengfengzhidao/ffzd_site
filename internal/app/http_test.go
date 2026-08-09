@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -39,7 +41,7 @@ func perform(handler http.Handler, method, path string, body io.Reader, cookies 
 
 func TestPublicRoutesHideInvisiblePostsAndExposeSEO(t *testing.T) {
 	a := newTestApp(t)
-	pub := &Post{Title: "公开文章", Slug: "public", Summary: "用于 SEO", Keywords: "Go,测试", Markdown: "# 正文", HTML: "<h1>正文</h1>", Status: "published", IsVisible: true}
+	pub := &Post{Title: "公开文章", Slug: "public", Summary: "用于 SEO", Keywords: "Go,测试", Markdown: "# 正文", HTML: `<h1>正文</h1><img src="/uploads/example.webp" alt="示例图片">`, Status: "published", IsVisible: true}
 	if err := a.store.SavePost(pub, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +53,14 @@ func TestPublicRoutesHideInvisiblePostsAndExposeSEO(t *testing.T) {
 	res := perform(handler, "GET", "/posts/public", nil)
 	if res.Code != 200 || !strings.Contains(res.Body.String(), "公开文章") || !strings.Contains(res.Body.String(), "application/ld+json") || !strings.Contains(res.Body.String(), `content="Go,测试"`) {
 		t.Fatalf("published page failed: %d %s", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Header().Get("Content-Security-Policy"), "img-src 'self' data: blob: http: https:") {
+		t.Fatal("image CSP must allow local Blob previews")
+	}
+	for _, expected := range []string{`data-image-lightbox`, `data-image-lightbox-close`, `aria-label="图片预览"`} {
+		if !strings.Contains(res.Body.String(), expected) {
+			t.Fatalf("article image preview is missing %q", expected)
+		}
 	}
 	if res = perform(handler, "GET", "/posts/hidden", nil); res.Code != 404 {
 		t.Fatalf("hidden post status = %d", res.Code)
@@ -128,10 +138,14 @@ func TestLoginCSRFAndAuthenticatedDashboard(t *testing.T) {
 	if formPage.Code != 200 || !strings.Contains(formPage.Body.String(), `name="category_name"`) || !strings.Contains(formPage.Body.String(), `data-tag-combobox`) || !strings.Contains(formPage.Body.String(), `class="composer-layer is-open"`) {
 		t.Fatalf("drawer taxonomy fields are missing: %d", formPage.Code)
 	}
-	for _, expected := range []string{`data-info-open`, `name="keywords"`, `data-info-layer`, `data-editor-count`, `composer-live-preview`, "自动从正文提取 60 个字符"} {
+	for _, expected := range []string{`data-info-open`, `name="keywords"`, `data-info-layer`, `data-editor-count`, `composer-live-preview`, "自动从正文提取 60 个字符", "可粘贴或选择图片上传"} {
 		if !strings.Contains(formPage.Body.String(), expected) {
 			t.Fatalf("two-step editor is missing %q", expected)
 		}
+	}
+	appJS := perform(handler, "GET", "/static/app.js", nil)
+	if appJS.Code != http.StatusOK || appJS.Header().Get("Cache-Control") != "no-cache" || !strings.Contains(appJS.Body.String(), `addEventListener('paste'`) || !strings.Contains(appJS.Body.String(), "uploadAndInsertImages") {
+		t.Fatalf("editor paste upload behavior is missing: %d", appJS.Code)
 	}
 	if strings.Contains(formPage.Body.String(), "保存为草稿") || strings.Contains(formPage.Body.String(), `name="status"`) {
 		t.Fatal("draft controls should not exist in the article composer")
@@ -144,6 +158,40 @@ func TestLoginCSRFAndAuthenticatedDashboard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	coverForm := url.Values{"csrf": {storedSession.CSRF}, "source": {"external"}, "external_url": {"https://images.example.com/cover.webp"}}
+	coverAdded := perform(handler, "POST", "/admin/covers", strings.NewReader(coverForm.Encode()), session)
+	if coverAdded.Code != http.StatusSeeOther {
+		t.Fatalf("external cover add failed: %d %s", coverAdded.Code, coverAdded.Body.String())
+	}
+	coversPage := perform(handler, "GET", "/admin/covers", nil, session)
+	if coversPage.Code != http.StatusOK || !strings.Contains(coversPage.Body.String(), `class="admin-nav-link active" href="/admin/covers"`) || !strings.Contains(coversPage.Body.String(), "https://images.example.com/cover.webp") {
+		t.Fatalf("cover management page failed: %d %s", coversPage.Code, coversPage.Body.String())
+	}
+	for _, expected := range []string{`data-cover-upload-open`, `data-cover-upload-dialog`, `data-cover-drop-zone`, `data-cover-preview-loading`, `class="cover-time"`, "选择图片或粘贴图片"} {
+		if !strings.Contains(coversPage.Body.String(), expected) {
+			t.Fatalf("cover upload modal is missing %q", expected)
+		}
+	}
+	secondCoverForm := url.Values{"csrf": {storedSession.CSRF}, "external_url": {"https://images.example.com/cover-2.webp"}}
+	jsonCoverRequest := httptest.NewRequest("POST", "/admin/covers", strings.NewReader(secondCoverForm.Encode()))
+	jsonCoverRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	jsonCoverRequest.Header.Set("Accept", "application/json")
+	jsonCoverRequest.AddCookie(session)
+	jsonCoverResponse := httptest.NewRecorder()
+	handler.ServeHTTP(jsonCoverResponse, jsonCoverRequest)
+	if jsonCoverResponse.Code != http.StatusOK || !strings.Contains(jsonCoverResponse.Body.String(), `"URL":"https://images.example.com/cover-2.webp"`) {
+		t.Fatalf("JSON cover upload failed: %d %s", jsonCoverResponse.Code, jsonCoverResponse.Body.String())
+	}
+	covers, err := a.store.Covers()
+	if err != nil || len(covers) != 2 {
+		t.Fatalf("cover library was not saved: %#v %v", covers, err)
+	}
+	var selectedCoverID int64
+	for _, cover := range covers {
+		if cover.URL == "https://images.example.com/cover.webp" {
+			selectedCoverID = cover.ID
+		}
+	}
 	postForm := url.Values{
 		"csrf":          {storedSession.CSRF},
 		"title":         {"内联分类测试"},
@@ -152,6 +200,7 @@ func TestLoginCSRFAndAuthenticatedDashboard(t *testing.T) {
 		"is_visible":    {"1"},
 		"category_name": {"新分类"},
 		"new_tags":      {"标签一，标签二, 标签一"},
+		"cover_id":      {strconv.FormatInt(selectedCoverID, 10)},
 	}
 	savedPost := perform(handler, "POST", "/admin/posts/new", strings.NewReader(postForm.Encode()), session)
 	if savedPost.Code != http.StatusSeeOther {
@@ -163,8 +212,37 @@ func TestLoginCSRFAndAuthenticatedDashboard(t *testing.T) {
 		t.Fatalf("inline taxonomies were not created: %#v %#v", categories, tags)
 	}
 	saved, err := a.store.PostByID(1)
-	if err != nil || saved.Status != "published" || !saved.IsVisible || saved.Summary != "正文" || saved.Keywords != "Go-1.26, SQLite" || saved.Slug != "go1.26" {
+	if err != nil || saved.Status != "published" || !saved.IsVisible || saved.Summary != "正文" || saved.Keywords != "Go-1.26, SQLite" || saved.Slug != "go1.26" || saved.CoverURL != "https://images.example.com/cover.webp" {
 		t.Fatalf("new article should be published and visible by default: %#v %v", saved, err)
+	}
+	postsPage = perform(handler, "GET", "/admin/posts", nil, session)
+	if !strings.Contains(postsPage.Body.String(), `href="/posts/go1.26">内联分类测试</a>`) || !strings.Contains(postsPage.Body.String(), `class="admin-post-cover"`) || !strings.Contains(postsPage.Body.String(), `/random-cover`) {
+		t.Fatal("admin post title should link to the public post detail page")
+	}
+	publicPosts := perform(handler, "GET", "/posts", nil)
+	if publicPosts.Code != http.StatusOK || !strings.Contains(publicPosts.Body.String(), `class="post-cover"`) || !strings.Contains(publicPosts.Body.String(), `src="https://images.example.com/cover.webp"`) {
+		t.Fatalf("public post cover is missing: %d %s", publicPosts.Code, publicPosts.Body.String())
+	}
+	randomized := perform(handler, "POST", "/admin/posts/1/random-cover", strings.NewReader(url.Values{"csrf": {storedSession.CSRF}}.Encode()), session)
+	if randomized.Code != http.StatusSeeOther {
+		t.Fatalf("random cover action failed: %d %s", randomized.Code, randomized.Body.String())
+	}
+	if !strings.Contains(postsPage.Body.String(), `href="/admin/posts?compose=1&amp;info=1">基本信息</a>`) {
+		t.Fatal("admin post list should expose the basic information editor")
+	}
+	for i := 0; i < 38; i++ {
+		if _, err := a.store.AddCover(fmt.Sprintf("https://images.example.com/library-%02d.webp", i), "external"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	infoPage := perform(handler, "GET", "/admin/posts?compose=1&info=1", nil, session)
+	for _, expected := range []string{`class="post-info-layer is-open"`, `data-info-direct="true"`, "编辑文章基本信息", `data-info-direct-save`, `value="内联分类测试"`, `data-current-cover`, `data-cover-select-layer`, `data-cover-select-confirm`, `data-post-cover-options`, `name="cover_id"`, "上传新封面"} {
+		if infoPage.Code != http.StatusOK || !strings.Contains(infoPage.Body.String(), expected) {
+			t.Fatalf("basic information editor is missing %q: %d", expected, infoPage.Code)
+		}
+	}
+	if count := strings.Count(infoPage.Body.String(), `class="post-cover-choice"`); count != 40 {
+		t.Fatalf("large cover library rendered %d choices, want 40", count)
 	}
 	editPage := perform(handler, "GET", "/admin/posts?compose=1", nil, session)
 	if editPage.Code != http.StatusOK || !strings.Contains(editPage.Body.String(), "编辑文章") || !strings.Contains(editPage.Body.String(), "内联分类测试") {
@@ -215,6 +293,17 @@ func TestParseNewTagNames(t *testing.T) {
 	}
 	if _, err := parseNewTagNames(strings.Repeat("长", 51)); err == nil {
 		t.Fatal("overlong tag should be rejected")
+	}
+}
+
+func TestValidateExternalImageURL(t *testing.T) {
+	if got, err := validateExternalImageURL(" https://example.com/image.webp "); err != nil || got != "https://example.com/image.webp" {
+		t.Fatalf("valid external image URL rejected: %q %v", got, err)
+	}
+	for _, raw := range []string{"javascript:alert(1)", "//example.com/image.png", "https://user:pass@example.com/image.png"} {
+		if _, err := validateExternalImageURL(raw); err == nil {
+			t.Fatalf("unsafe external image URL accepted: %s", raw)
+		}
 	}
 }
 
