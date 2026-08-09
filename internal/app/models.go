@@ -22,6 +22,25 @@ type Cover struct {
 	CreatedAt time.Time
 }
 
+type Topic struct {
+	ID            int64
+	Name, Slug    string
+	CoverID       *int64
+	CoverURL      string
+	DocumentCount int
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+type TopicNode struct {
+	ID, TopicID                int64
+	ParentID, PostID           *int64
+	Title, PostTitle, PostPath string
+	SortOrder, Depth           int
+	Post                       *Post
+	CreatedAt, UpdatedAt       time.Time
+}
+
 type Category struct {
 	ID         int64
 	Name, Slug string

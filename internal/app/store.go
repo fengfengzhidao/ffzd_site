@@ -619,6 +619,266 @@ func (s *Store) DeleteCover(id int64) error {
 	return nil
 }
 
+func scanTopic(row interface{ Scan(...any) error }) (Topic, error) {
+	var value Topic
+	var coverID sql.NullInt64
+	var coverURL sql.NullString
+	err := row.Scan(&value.ID, &value.Name, &value.Slug, &coverID, &coverURL, &value.DocumentCount, &value.CreatedAt, &value.UpdatedAt)
+	if coverID.Valid {
+		value.CoverID = &coverID.Int64
+	}
+	value.CoverURL = coverURL.String
+	return value, err
+}
+
+const topicSelect = `SELECT t.id,t.name,t.slug,t.cover_id,c.url,
+ (SELECT COUNT(*) FROM topic_nodes n WHERE n.topic_id=t.id AND n.post_id IS NOT NULL),
+ t.created_at,t.updated_at FROM topics t LEFT JOIN covers c ON c.id=t.cover_id`
+
+func (s *Store) Topics() ([]Topic, error) {
+	rows, err := s.DB.Query(topicSelect + " ORDER BY t.updated_at DESC,t.id DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var values []Topic
+	for rows.Next() {
+		value, scanErr := scanTopic(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		values = append(values, value)
+	}
+	return values, rows.Err()
+}
+
+func (s *Store) PublicTopics() ([]Topic, error) {
+	query := `SELECT t.id,t.name,t.slug,t.cover_id,c.url,
+ (SELECT COUNT(*) FROM topic_nodes n JOIN posts p ON p.id=n.post_id WHERE n.topic_id=t.id AND p.status='published' AND p.is_visible=1),
+ t.created_at,t.updated_at FROM topics t LEFT JOIN covers c ON c.id=t.cover_id ORDER BY t.updated_at DESC,t.id DESC`
+	rows, err := s.DB.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var values []Topic
+	for rows.Next() {
+		value, scanErr := scanTopic(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		values = append(values, value)
+	}
+	return values, rows.Err()
+}
+
+func (s *Store) TopicByID(id int64) (Topic, error) {
+	return scanTopic(s.DB.QueryRow(topicSelect+" WHERE t.id=?", id))
+}
+
+func (s *Store) TopicBySlug(slug string) (Topic, error) {
+	return scanTopic(s.DB.QueryRow(topicSelect+" WHERE t.slug=?", slug))
+}
+
+func (s *Store) TopicSlugExists(slug string, except int64) bool {
+	var count int
+	_ = s.DB.QueryRow("SELECT COUNT(*) FROM topics WHERE slug=? AND id<>?", slug, except).Scan(&count)
+	return count > 0
+}
+
+func (s *Store) SaveTopic(topic *Topic) error {
+	if topic.ID == 0 {
+		result, err := s.DB.Exec("INSERT INTO topics(name,slug,cover_id,updated_at) VALUES(?,?,?,?)", topic.Name, topic.Slug, topic.CoverID, time.Now())
+		if err != nil {
+			return err
+		}
+		topic.ID, err = result.LastInsertId()
+		return err
+	}
+	result, err := s.DB.Exec("UPDATE topics SET name=?,cover_id=?,updated_at=? WHERE id=?", topic.Name, topic.CoverID, time.Now(), topic.ID)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) DeleteTopic(id int64) error {
+	result, err := s.DB.Exec("DELETE FROM topics WHERE id=?", id)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) TopicNodes(topicID int64, public bool) ([]TopicNode, error) {
+	condition := ""
+	if public {
+		condition = " AND (n.post_id IS NULL OR (p.status='published' AND p.is_visible=1))"
+	}
+	rows, err := s.DB.Query(`SELECT n.id,n.topic_id,n.parent_id,n.post_id,n.title,n.sort_order,
+ COALESCE(p.title,''),COALESCE(p.slug,''),COALESCE(p.keywords,''),n.created_at,n.updated_at
+ FROM topic_nodes n LEFT JOIN posts p ON p.id=n.post_id WHERE n.topic_id=?`+condition+` ORDER BY n.sort_order,n.id`, topicID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var raw []TopicNode
+	for rows.Next() {
+		var node TopicNode
+		var parentID, postID sql.NullInt64
+		var postSlug, postKeywords string
+		if err = rows.Scan(&node.ID, &node.TopicID, &parentID, &postID, &node.Title, &node.SortOrder, &node.PostTitle, &postSlug, &postKeywords, &node.CreatedAt, &node.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if parentID.Valid {
+			node.ParentID = &parentID.Int64
+		}
+		if postID.Valid {
+			node.PostID = &postID.Int64
+			node.PostPath = postSlug
+			if keywordPath := KeywordSlug(postKeywords); keywordPath != "" {
+				node.PostPath = keywordPath
+			}
+		}
+		raw = append(raw, node)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	children := make(map[int64][]TopicNode)
+	ids := make(map[int64]bool)
+	for _, node := range raw {
+		ids[node.ID] = true
+	}
+	for _, node := range raw {
+		parent := int64(0)
+		if node.ParentID != nil && ids[*node.ParentID] {
+			parent = *node.ParentID
+		}
+		children[parent] = append(children[parent], node)
+	}
+	var ordered []TopicNode
+	visited := make(map[int64]bool)
+	var walk func(int64, int)
+	walk = func(parent int64, depth int) {
+		for _, node := range children[parent] {
+			if visited[node.ID] {
+				continue
+			}
+			visited[node.ID] = true
+			node.Depth = depth
+			ordered = append(ordered, node)
+			walk(node.ID, depth+1)
+		}
+	}
+	walk(0, 0)
+	for _, node := range raw {
+		if !visited[node.ID] {
+			node.Depth = 0
+			ordered = append(ordered, node)
+			walk(node.ID, 1)
+		}
+	}
+	return ordered, nil
+}
+
+func (s *Store) SaveTopicNode(node *TopicNode) error {
+	if node.ParentID != nil {
+		var parentTopicID int64
+		if err := s.DB.QueryRow("SELECT topic_id FROM topic_nodes WHERE id=?", *node.ParentID).Scan(&parentTopicID); err != nil || parentTopicID != node.TopicID {
+			return errors.New("父级目录无效")
+		}
+		for parent := node.ParentID; parent != nil; {
+			if *parent == node.ID && node.ID != 0 {
+				return errors.New("不能将节点移动到自己的下级")
+			}
+			var next sql.NullInt64
+			if err := s.DB.QueryRow("SELECT parent_id FROM topic_nodes WHERE id=?", *parent).Scan(&next); err != nil {
+				return err
+			}
+			if next.Valid {
+				parent = &next.Int64
+			} else {
+				parent = nil
+			}
+		}
+	}
+	if node.PostID != nil {
+		var exists int
+		if err := s.DB.QueryRow("SELECT COUNT(*) FROM posts WHERE id=?", *node.PostID).Scan(&exists); err != nil || exists == 0 {
+			return errors.New("关联文章无效")
+		}
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if node.ID == 0 {
+		result, execErr := tx.Exec("INSERT INTO topic_nodes(topic_id,parent_id,post_id,title,sort_order,updated_at) VALUES(?,?,?,?,?,?)", node.TopicID, node.ParentID, node.PostID, node.Title, node.SortOrder, time.Now())
+		if execErr != nil {
+			return execErr
+		}
+		node.ID, err = result.LastInsertId()
+	} else {
+		result, execErr := tx.Exec("UPDATE topic_nodes SET parent_id=?,post_id=?,title=?,sort_order=?,updated_at=? WHERE id=? AND topic_id=?", node.ParentID, node.PostID, node.Title, node.SortOrder, time.Now(), node.ID, node.TopicID)
+		if execErr != nil {
+			return execErr
+		}
+		changed, rowsErr := result.RowsAffected()
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if changed == 0 {
+			return sql.ErrNoRows
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec("UPDATE topics SET updated_at=? WHERE id=?", time.Now(), node.TopicID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) DeleteTopicNode(topicID, nodeID int64) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec("DELETE FROM topic_nodes WHERE id=? AND topic_id=?", nodeID, topicID)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return sql.ErrNoRows
+	}
+	if _, err = tx.Exec("UPDATE topics SET updated_at=? WHERE id=?", time.Now(), topicID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) RandomizePostCover(id int64) error {
 	tx, err := s.DB.Begin()
 	if err != nil {

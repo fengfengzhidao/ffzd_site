@@ -63,6 +63,214 @@
     });
   });
 
+  const closeTopicDialog = (dialog) => {
+    if (!dialog) return;
+    dialog.hidden = true;
+    document.body.classList.remove('topic-dialog-open');
+  };
+  document.querySelectorAll('[data-topic-modal-open]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const dialog = document.getElementById(button.dataset.topicModalOpen);
+      if (!dialog) return;
+      dialog.hidden = false;
+      document.body.classList.add('topic-dialog-open');
+      window.setTimeout(() => dialog.querySelector('input:not([type="hidden"]),button')?.focus(), 30);
+    });
+  });
+  document.querySelectorAll('[data-topic-dialog]').forEach((dialog) => {
+    dialog.querySelectorAll('[data-topic-dialog-close]').forEach((button) => button.addEventListener('click', () => closeTopicDialog(dialog)));
+    dialog.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') closeTopicDialog(dialog);
+    });
+  });
+  document.querySelectorAll('[data-topic-tree]').forEach((tree) => {
+    const form = tree.querySelector('[data-topic-node-form]');
+    const deleteButton = tree.querySelector('[data-topic-node-delete]');
+    const deleteForm = tree.querySelector('[data-topic-node-delete-form]');
+    const nodeList = tree.querySelector('.topic-node-list');
+    const parentDisplay = form.querySelector('[data-topic-parent-display]');
+    const collapsedNodes = new Set();
+    let status = tree.querySelector('[data-topic-node-status]');
+    const setValue = (name, value) => {
+      const field = form.elements.namedItem(name);
+      if (field) field.value = value || '';
+    };
+    const showStatus = (message, error = false) => {
+      if (!status) {
+        status = document.createElement('p');
+        status.dataset.topicNodeStatus = '';
+        status.className = 'topic-node-status';
+        form.querySelector('footer').before(status);
+      }
+      status.textContent = message;
+      status.classList.toggle('is-error', error);
+    };
+    const findNode = (id) => Array.from(nodeList.querySelectorAll('[data-topic-node]')).find((node) => node.dataset.id === String(id));
+    const setParent = (id) => {
+      setValue('parent_id', id);
+      parentDisplay.textContent = id ? (findNode(id)?.dataset.title || '所选目录') : '根目录';
+    };
+    const setDirectoryCollapsed = (button, collapsed) => {
+      if (!button?.dataset.directory) return;
+      button.classList.toggle('collapsed', collapsed);
+      if (collapsed) collapsedNodes.add(button.dataset.id);
+      else collapsedNodes.delete(button.dataset.id);
+      const toggle = button.querySelector('[data-topic-toggle]');
+      if (toggle) {
+        toggle.textContent = collapsed ? '▸' : '▾';
+        toggle.setAttribute('aria-label', collapsed ? '展开目录' : '折叠目录');
+      }
+    };
+    const syncNodeVisibility = () => {
+      const collapsedDepths = [];
+      nodeList.querySelectorAll('[data-topic-node]').forEach((button) => {
+        const depth = Number(button.dataset.depth) || 0;
+        while (collapsedDepths.length && collapsedDepths.at(-1) >= depth) collapsedDepths.pop();
+        button.hidden = collapsedDepths.length > 0;
+        if (button.dataset.directory && button.classList.contains('collapsed')) collapsedDepths.push(depth);
+      });
+    };
+    const selectNode = (button) => {
+      tree.querySelectorAll('[data-topic-node]').forEach((node) => node.classList.toggle('active', node === button));
+      setValue('node_id', button.dataset.id);
+      setValue('title', button.dataset.title);
+      setParent(button.dataset.parent);
+      setValue('post_id', button.dataset.post);
+      setValue('sort_order', button.dataset.order || '0');
+      deleteButton.disabled = false;
+      deleteForm.action = `${form.action}/${button.dataset.id}/delete`;
+      form.querySelector('input[name="title"]')?.focus();
+    };
+    const renderNodes = (nodes, selectedID = 0) => {
+      nodeList.replaceChildren();
+      const nodeValues = new Map(nodes.map((node) => [node.ID, node]));
+      for (let current = nodeValues.get(selectedID); current?.ParentID != null; current = nodeValues.get(current.ParentID)) {
+        collapsedNodes.delete(String(current.ParentID));
+      }
+      if (!nodes.length) {
+        const empty = document.createElement('p');
+        empty.className = 'empty';
+        empty.textContent = '暂无节点';
+        nodeList.append(empty);
+      }
+      nodes.forEach((node) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.dataset.topicNode = '';
+        button.dataset.id = String(node.ID);
+        button.dataset.title = node.Title;
+        button.dataset.parent = node.ParentID == null ? '' : String(node.ParentID);
+        button.dataset.post = node.PostID == null ? '' : String(node.PostID);
+        button.dataset.order = String(node.SortOrder);
+        button.dataset.depth = String(node.Depth);
+        if (node.PostID == null) button.dataset.directory = 'true';
+        const title = document.createElement('span');
+        title.append(document.createTextNode('　'.repeat(node.Depth)));
+        if (node.PostID == null) {
+          const toggle = document.createElement('i');
+          toggle.dataset.topicToggle = '';
+          toggle.setAttribute('aria-label', '折叠目录');
+          title.append(toggle, document.createTextNode(` ${node.Title}`));
+        } else {
+          title.append(document.createTextNode(`▤ ${node.Title}`));
+        }
+        button.append(title);
+        if (node.PostID == null) setDirectoryCollapsed(button, collapsedNodes.has(String(node.ID)));
+        if (node.PostTitle) {
+          const postTitle = document.createElement('small');
+          postTitle.textContent = node.PostTitle;
+          button.append(postTitle);
+        }
+        nodeList.append(button);
+        if (node.ID === selectedID) selectNode(button);
+      });
+      syncNodeVisibility();
+    };
+    nodeList.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-topic-node]');
+      if (!button) return;
+      if (event.target.closest('[data-topic-toggle]')) {
+        setDirectoryCollapsed(button, !button.classList.contains('collapsed'));
+        syncNodeVisibility();
+        return;
+      }
+      selectNode(button);
+    });
+    tree.querySelector('[data-topic-node-new]')?.addEventListener('click', () => {
+      const selected = nodeList.querySelector('[data-topic-node].active');
+      const parent = selected?.dataset.directory ? selected : null;
+      form.reset();
+      setValue('node_id', '');
+      setParent(parent?.dataset.id || '');
+      setValue('sort_order', '0');
+      tree.querySelectorAll('[data-topic-node]').forEach((node) => node.classList.remove('active'));
+      if (parent) {
+        setDirectoryCollapsed(parent, false);
+        syncNodeVisibility();
+      }
+      deleteButton.disabled = true;
+      deleteForm.removeAttribute('action');
+      form.querySelector('input[name="title"]')?.focus();
+    });
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const submitButton = event.submitter || form.querySelector('button[type="submit"]');
+      submitButton.disabled = true;
+      showStatus('正在保存…');
+      try {
+        const response = await fetch(form.action, { method: 'POST', headers: { Accept: 'application/json' }, body: new FormData(form) });
+        if (!response.ok) throw new Error((await response.text()).trim() || '保存失败');
+        const result = await response.json();
+        renderNodes(result.nodes || [], result.selectedID || 0);
+        showStatus('节点已保存，文档树已刷新');
+      } catch (error) {
+        showStatus(error.message || '保存失败，请稍后重试', true);
+      } finally {
+        submitButton.disabled = false;
+      }
+    });
+    deleteForm.addEventListener('submit', async (event) => {
+      if (event.defaultPrevented) return;
+      event.preventDefault();
+      deleteButton.disabled = true;
+      showStatus('正在删除…');
+      try {
+        const response = await fetch(deleteForm.action, { method: 'POST', headers: { Accept: 'application/json' }, body: new FormData(deleteForm) });
+        if (!response.ok) throw new Error((await response.text()).trim() || '删除失败');
+        const result = await response.json();
+        renderNodes(result.nodes || []);
+        form.reset();
+        setValue('node_id', '');
+        setParent('');
+        setValue('sort_order', '0');
+        deleteForm.removeAttribute('action');
+        showStatus('节点已删除，文档树已刷新');
+      } catch (error) {
+        deleteButton.disabled = false;
+        showStatus(error.message || '删除失败，请稍后重试', true);
+      }
+    });
+  });
+
+  const topicReader = document.querySelector('[data-topic-reader]');
+  if (topicReader) {
+    const toggle = topicReader.querySelector('[data-topic-tree-toggle]');
+    const closeTree = () => {
+      topicReader.classList.remove('tree-open');
+      document.body.classList.remove('topic-tree-open');
+      toggle?.setAttribute('aria-expanded', 'false');
+    };
+    toggle?.addEventListener('click', () => {
+      topicReader.classList.add('tree-open');
+      document.body.classList.add('topic-tree-open');
+      toggle.setAttribute('aria-expanded', 'true');
+    });
+    topicReader.querySelectorAll('[data-topic-tree-close]').forEach((button) => button.addEventListener('click', closeTree));
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && topicReader.classList.contains('tree-open')) closeTree();
+    });
+  }
+
   const composerLayer = document.querySelector('[data-composer-layer]');
   const infoLayer = composerLayer?.querySelector('[data-info-layer]');
   const infoOpenedDirectly = infoLayer?.dataset.infoDirect === 'true';

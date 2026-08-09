@@ -87,6 +87,90 @@ func TestPublicRoutesHideInvisiblePostsAndExposeSEO(t *testing.T) {
 	}
 }
 
+func TestTopicAdminAndPublicReadingRoutes(t *testing.T) {
+	a := newTestApp(t)
+	post := &Post{Title: "专题文章", Slug: "topic-post", Markdown: "正文", HTML: "<p>专题正文</p>", Status: "published", IsVisible: true}
+	if err := a.store.SavePost(post, nil); err != nil {
+		t.Fatal(err)
+	}
+	admin, err := a.store.Authenticate("admin", "very-strong-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, csrf, err := a.store.CreateSession(admin.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &http.Cookie{Name: "session", Value: token}
+	handler := a.server.Handler
+
+	create := url.Values{"csrf": {csrf}, "name": {"Go 入门专题"}}
+	response := perform(handler, http.MethodPost, "/admin/topics/new", strings.NewReader(create.Encode()), session)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("create topic failed: %d %s", response.Code, response.Body.String())
+	}
+	topics, _ := a.store.Topics()
+	if len(topics) != 1 {
+		t.Fatalf("topic was not created: %#v", topics)
+	}
+	node := url.Values{"csrf": {csrf}, "title": {"第一章：快速开始"}, "sort_order": {"1"}}
+	response = perform(handler, http.MethodPost, fmt.Sprintf("/admin/topics/%d/nodes", topics[0].ID), strings.NewReader(node.Encode()), session)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("create node failed: %d %s", response.Code, response.Body.String())
+	}
+	jsonNode := url.Values{"csrf": {csrf}, "title": {"第二章：异步刷新"}, "parent_id": {"1"}, "post_id": {strconv.FormatInt(post.ID, 10)}, "sort_order": {"2"}}
+	jsonRequest := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/admin/topics/%d/nodes", topics[0].ID), strings.NewReader(jsonNode.Encode()))
+	jsonRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	jsonRequest.Header.Set("Accept", "application/json")
+	jsonRequest.AddCookie(session)
+	jsonResponse := httptest.NewRecorder()
+	handler.ServeHTTP(jsonResponse, jsonRequest)
+	if jsonResponse.Code != http.StatusOK || !strings.Contains(jsonResponse.Body.String(), `"selectedID"`) || !strings.Contains(jsonResponse.Body.String(), "第二章：异步刷新") {
+		t.Fatalf("JSON node refresh failed: %d %s", jsonResponse.Code, jsonResponse.Body.String())
+	}
+	adminPage := perform(handler, http.MethodGet, "/admin/topics", nil, session)
+	for _, expected := range []string{`class="admin-nav-link active" href="/admin/topics"`, "关联文档", `data-topic-tree`, `data-topic-toggle`, `type="hidden" name="parent_id"`, "第一章：快速开始"} {
+		if adminPage.Code != http.StatusOK || !strings.Contains(adminPage.Body.String(), expected) {
+			t.Fatalf("topic admin page is missing %q: %d %s", expected, adminPage.Code, adminPage.Body.String())
+		}
+	}
+	if strings.Contains(adminPage.Body.String(), `<select name="parent_id">`) {
+		t.Fatal("topic parent directory should not be manually selectable")
+	}
+	appJS := perform(handler, http.MethodGet, "/static/app.js", nil)
+	if appJS.Code != http.StatusOK || !strings.Contains(appJS.Body.String(), "renderNodes(result.nodes") || !strings.Contains(appJS.Body.String(), "节点已保存，文档树已刷新") || !strings.Contains(appJS.Body.String(), "selected?.dataset.directory ? selected : null") || !strings.Contains(appJS.Body.String(), "syncNodeVisibility") {
+		t.Fatalf("topic tree partial refresh script is missing: %d", appJS.Code)
+	}
+	style := perform(handler, http.MethodGet, "/static/style.css", nil)
+	if style.Code != http.StatusOK || !strings.Contains(style.Body.String(), ".topic-node-list>button[hidden]{display:none}") {
+		t.Fatalf("collapsed topic children are not explicitly hidden: %d", style.Code)
+	}
+	listPage := perform(handler, http.MethodGet, "/topics", nil)
+	publicTopicPath := "/topics/" + url.PathEscape(topics[0].Slug)
+	if listPage.Code != http.StatusOK || !strings.Contains(listPage.Body.String(), "Go 入门专题") || !strings.Contains(listPage.Body.String(), `href="/topics/`) {
+		t.Fatalf("public topic list failed: %d %s", listPage.Code, listPage.Body.String())
+	}
+	detailPage := perform(handler, http.MethodGet, publicTopicPath, nil)
+	if detailPage.Code != http.StatusOK || !strings.Contains(detailPage.Body.String(), "专题正文") || !strings.Contains(detailPage.Body.String(), "第一章：快速开始") || !strings.Contains(detailPage.Body.String(), `data-topic-tree-toggle`) || strings.Contains(detailPage.Body.String(), "ZgotmplZ") {
+		t.Fatalf("public topic reader failed: %d %s", detailPage.Code, detailPage.Body.String())
+	}
+	rawUnicodeDetail := perform(handler, http.MethodGet, "/topics/"+topics[0].Slug, nil)
+	if rawUnicodeDetail.Code != http.StatusOK || !strings.Contains(rawUnicodeDetail.Body.String(), "专题正文") {
+		t.Fatalf("raw Unicode topic URL failed: %d %s", rawUnicodeDetail.Code, rawUnicodeDetail.Body.String())
+	}
+	missingTopic := perform(handler, http.MethodGet, "/topics/not-found", nil)
+	if missingTopic.Code != http.StatusNotFound || missingTopic.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("topic 404 must not be cached: %d %q", missingTopic.Code, missingTopic.Header().Get("Cache-Control"))
+	}
+	sitemap := perform(handler, http.MethodGet, "/sitemap.xml", nil)
+	if sitemap.Code != http.StatusOK || !strings.Contains(sitemap.Body.String(), "/topics") || !strings.Contains(sitemap.Body.String(), "/topic-post") {
+		t.Fatalf("topic sitemap entries are missing: %s", sitemap.Body.String())
+	}
+	if badCSRF := perform(handler, http.MethodPost, "/admin/topics/new", strings.NewReader(url.Values{"name": {"越权专题"}}.Encode()), session); badCSRF.Code != http.StatusForbidden {
+		t.Fatalf("topic mutation did not enforce CSRF: %d", badCSRF.Code)
+	}
+}
+
 func TestLoginCSRFAndAuthenticatedDashboard(t *testing.T) {
 	a := newTestApp(t)
 	handler := a.server.Handler

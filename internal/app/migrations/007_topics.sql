@@ -1,0 +1,23 @@
+CREATE TABLE topics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  slug TEXT NOT NULL UNIQUE,
+  cover_id INTEGER REFERENCES covers(id) ON DELETE SET NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE topic_nodes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  parent_id INTEGER REFERENCES topic_nodes(id) ON DELETE CASCADE,
+  post_id INTEGER REFERENCES posts(id) ON DELETE SET NULL,
+  title TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CHECK(parent_id IS NULL OR parent_id <> id)
+);
+
+CREATE INDEX idx_topic_nodes_tree ON topic_nodes(topic_id, parent_id, sort_order, id);
+CREATE INDEX idx_topic_nodes_post ON topic_nodes(post_id);

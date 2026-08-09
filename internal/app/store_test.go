@@ -44,8 +44,62 @@ func TestStoreAdminSessionAndMigration(t *testing.T) {
 		t.Fatalf("deleted session remains: %v", err)
 	}
 	var versions int
-	if err = s.DB.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 6 {
+	if err = s.DB.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 7 {
 		t.Fatalf("migration tracking failed: %d %v", versions, err)
+	}
+}
+
+func TestTopicTreeLifecycleAndPublicVisibility(t *testing.T) {
+	s := newTestStore(t)
+	visible := &Post{Title: "公开文档", Slug: "public-doc", Markdown: "正文", HTML: "<p>公开正文</p>", Status: "published", IsVisible: true}
+	hidden := &Post{Title: "隐藏文档", Slug: "hidden-doc", Markdown: "隐藏", HTML: "<p>隐藏正文</p>", Status: "published", IsVisible: false}
+	if err := s.SavePost(visible, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SavePost(hidden, nil); err != nil {
+		t.Fatal(err)
+	}
+	topic := &Topic{Name: "Go 专题", Slug: "go-topic"}
+	if err := s.SaveTopic(topic); err != nil {
+		t.Fatal(err)
+	}
+	directory := &TopicNode{TopicID: topic.ID, Title: "第一章", SortOrder: 1}
+	if err := s.SaveTopicNode(directory); err != nil {
+		t.Fatal(err)
+	}
+	visibleNode := &TopicNode{TopicID: topic.ID, ParentID: &directory.ID, PostID: &visible.ID, Title: "开始使用", SortOrder: 1}
+	if err := s.SaveTopicNode(visibleNode); err != nil {
+		t.Fatal(err)
+	}
+	hiddenNode := &TopicNode{TopicID: topic.ID, ParentID: &directory.ID, PostID: &hidden.ID, Title: "内部草稿", SortOrder: 2}
+	if err := s.SaveTopicNode(hiddenNode); err != nil {
+		t.Fatal(err)
+	}
+
+	topics, err := s.Topics()
+	if err != nil || len(topics) != 1 || topics[0].DocumentCount != 2 {
+		t.Fatalf("topic list mismatch: %#v %v", topics, err)
+	}
+	allNodes, err := s.TopicNodes(topic.ID, false)
+	if err != nil || len(allNodes) != 3 || allNodes[1].Depth != 1 || allNodes[1].PostPath != "public-doc" {
+		t.Fatalf("admin tree mismatch: %#v %v", allNodes, err)
+	}
+	publicNodes, err := s.TopicNodes(topic.ID, true)
+	if err != nil || len(publicNodes) != 2 || publicNodes[1].ID != visibleNode.ID {
+		t.Fatalf("hidden article leaked into topic tree: %#v %v", publicNodes, err)
+	}
+	directory.ParentID = &visibleNode.ID
+	if err = s.SaveTopicNode(directory); err == nil {
+		t.Fatal("topic tree cycle should be rejected")
+	}
+	if err = s.DeleteTopicNode(topic.ID, directory.ID); err != nil {
+		t.Fatal(err)
+	}
+	if nodes, _ := s.TopicNodes(topic.ID, false); len(nodes) != 0 {
+		t.Fatalf("child nodes were not deleted with directory: %#v", nodes)
+	}
+	if err = s.DeleteTopic(topic.ID); err != nil {
+		t.Fatal(err)
 	}
 }
 

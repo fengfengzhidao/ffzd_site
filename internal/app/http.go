@@ -54,6 +54,10 @@ type viewData struct {
 	Feedbacks                                                     []Feedback
 	Categories                                                    []Category
 	Tags                                                          []Tag
+	Topics                                                        []Topic
+	Topic                                                         *Topic
+	TopicNodes                                                    []TopicNode
+	ActiveTopicNode                                               *TopicNode
 	Stats                                                         DashboardStats
 	Page, TotalPages, Total                                       int
 	Query, ActiveTag                                              string
@@ -95,6 +99,16 @@ func New(cfg Config) (*App, error) {
 			}
 			return strings.Join(names, ", ")
 		},
+		"topicNodesFor": func(nodes []TopicNode, topicID int64) []TopicNode {
+			values := make([]TopicNode, 0)
+			for _, node := range nodes {
+				if node.TopicID == topicID {
+					values = append(values, node)
+				}
+			}
+			return values
+		},
+		"treePrefix": func(depth int) string { return strings.Repeat("　", depth) },
 		"seq": func(n int) []int {
 			v := make([]int, n)
 			for i := range v {
@@ -161,6 +175,9 @@ func (a *App) routes() http.Handler {
 	r.Get("/posts/{slug}", a.postDetail)
 	r.Get("/categories/{slug}", a.categoryPosts)
 	r.Get("/tags/{slug}", a.tagPosts)
+	r.Get("/topics", a.topics)
+	r.Get("/topics/{slug}", a.topicDetail)
+	r.Get("/topics/{slug}/{post}", a.topicDetail)
 	r.Get("/sitemap.xml", a.sitemap)
 	r.Get("/robots.txt", a.robots)
 	r.Route("/admin", func(r chi.Router) {
@@ -181,6 +198,12 @@ func (a *App) routes() http.Handler {
 			r.Get("/covers", a.coversPage)
 			r.Post("/covers", a.addCover)
 			r.Post("/covers/{id}/delete", a.deleteCover)
+			r.Get("/topics", a.adminTopics)
+			r.Post("/topics/new", a.saveTopic)
+			r.Post("/topics/{id}", a.saveTopic)
+			r.Post("/topics/{id}/delete", a.deleteTopic)
+			r.Post("/topics/{id}/nodes", a.saveTopicNode)
+			r.Post("/topics/{id}/nodes/{nodeID}/delete", a.deleteTopicNode)
 			r.Get("/feedback", a.adminFeedback)
 			r.Post("/feedback/{id}/read", a.setFeedbackRead)
 			r.Post("/feedback/{id}/delete", a.deleteFeedback)
@@ -379,7 +402,61 @@ func (a *App) postDetail(w http.ResponseWriter, r *http.Request) {
 	d.JSONLD = template.JS(payload)
 	a.render(w, r, "post.html", d, 200)
 }
+
+func (a *App) topics(w http.ResponseWriter, r *http.Request) {
+	d := a.baseData(r, "专题", "按专题系统阅读系列文章")
+	d.Topics, _ = a.store.PublicTopics()
+	a.render(w, r, "topics.html", d, http.StatusOK)
+}
+
+func (a *App) topicDetail(w http.ResponseWriter, r *http.Request) {
+	topic, err := a.store.TopicBySlug(chi.URLParam(r, "slug"))
+	if err != nil {
+		a.notFound(w, r)
+		return
+	}
+	nodes, err := a.store.TopicNodes(topic.ID, true)
+	if err != nil {
+		http.Error(w, "专题加载失败", http.StatusInternalServerError)
+		return
+	}
+	requested := chi.URLParam(r, "post")
+	var active *TopicNode
+	for i := range nodes {
+		if nodes[i].PostID == nil {
+			continue
+		}
+		if requested == "" || nodes[i].PostPath == requested {
+			active = &nodes[i]
+			break
+		}
+	}
+	if requested != "" && active == nil {
+		a.notFound(w, r)
+		return
+	}
+	if active != nil {
+		post, postErr := a.store.PublishedByPath(active.PostPath)
+		if postErr != nil {
+			a.notFound(w, r)
+			return
+		}
+		active.Post = &post
+	}
+	desc := "专题：" + topic.Name
+	d := a.baseData(r, topic.Name, desc)
+	d.Topic = &topic
+	d.TopicNodes = nodes
+	d.ActiveTopicNode = active
+	if active != nil {
+		d.Post = active.Post
+		d.Title = active.Title + " · " + topic.Name
+		d.Description = active.Post.Summary
+	}
+	a.render(w, r, "topic.html", d, http.StatusOK)
+}
 func (a *App) notFound(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	d := a.baseData(r, "页面未找到", "请求的页面不存在")
 	a.render(w, r, "404.html", d, 404)
 }
@@ -387,10 +464,21 @@ func (a *App) notFound(w http.ResponseWriter, r *http.Request) {
 func (a *App) sitemap(w http.ResponseWriter, r *http.Request) {
 	settings, _ := a.store.Settings()
 	slugs, _ := a.store.PublishedSlugs()
+	topics, _ := a.store.PublicTopics()
+	baseURL := template.HTMLEscapeString(strings.TrimRight(settings.SiteURL, "/"))
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	fmt.Fprintf(w, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"><url><loc>%s/</loc></url><url><loc>%s/posts</loc></url>", template.HTMLEscapeString(strings.TrimRight(settings.SiteURL, "/")), template.HTMLEscapeString(strings.TrimRight(settings.SiteURL, "/")))
+	fmt.Fprintf(w, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"><url><loc>%s/</loc></url><url><loc>%s/posts</loc></url><url><loc>%s/topics</loc></url>", baseURL, baseURL, baseURL)
 	for _, s := range slugs {
-		fmt.Fprintf(w, "<url><loc>%s/posts/%s</loc></url>", template.HTMLEscapeString(strings.TrimRight(settings.SiteURL, "/")), url.PathEscape(s))
+		fmt.Fprintf(w, "<url><loc>%s/posts/%s</loc></url>", baseURL, url.PathEscape(s))
+	}
+	for _, topic := range topics {
+		fmt.Fprintf(w, "<url><loc>%s/topics/%s</loc></url>", baseURL, url.PathEscape(topic.Slug))
+		nodes, _ := a.store.TopicNodes(topic.ID, true)
+		for _, node := range nodes {
+			if node.PostID != nil {
+				fmt.Fprintf(w, "<url><loc>%s/topics/%s/%s</loc></url>", baseURL, url.PathEscape(topic.Slug), url.PathEscape(node.PostPath))
+			}
+		}
 	}
 	io.WriteString(w, "</urlset>")
 }
@@ -524,6 +612,120 @@ func (a *App) adminPosts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a.render(w, r, "admin_posts.html", d, 200)
+}
+
+func (a *App) adminTopics(w http.ResponseWriter, r *http.Request) {
+	d := a.baseData(r, "专题管理", "")
+	d.Topics, _ = a.store.Topics()
+	d.Posts, _, _ = a.store.ListPosts(r.Context(), false, "", "", 1, 1000)
+	d.Covers, _ = a.store.Covers()
+	for i := range d.Topics {
+		nodes, _ := a.store.TopicNodes(d.Topics[i].ID, false)
+		d.TopicNodes = append(d.TopicNodes, nodes...)
+	}
+	if r.URL.Query().Get("saved") == "1" {
+		d.Flash = "专题已保存"
+	} else if r.URL.Query().Get("node_saved") == "1" {
+		d.Flash = "文档树已更新"
+	}
+	a.render(w, r, "admin_topics.html", d, http.StatusOK)
+}
+
+func (a *App) saveTopic(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" || utf8.RuneCountInString(name) > 100 {
+		http.Error(w, "专题名称不能为空且不能超过 100 个字符", http.StatusBadRequest)
+		return
+	}
+	var coverID *int64
+	if raw := strings.TrimSpace(r.FormValue("cover_id")); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value <= 0 {
+			http.Error(w, "请选择有效的专题封面", http.StatusBadRequest)
+			return
+		}
+		coverID = &value
+	}
+	topic := Topic{ID: id, Name: name, CoverID: coverID}
+	if id == 0 {
+		topic.Slug = UniqueSlug(name, func(value string) bool { return a.store.TopicSlugExists(value, 0) })
+	}
+	if err := a.store.SaveTopic(&topic); err != nil {
+		http.Error(w, "专题保存失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "/admin/topics?saved=1", http.StatusSeeOther)
+}
+
+func (a *App) deleteTopic(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if id <= 0 || a.store.DeleteTopic(id) != nil {
+		http.Error(w, "删除专题失败", http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "/admin/topics", http.StatusSeeOther)
+}
+
+func (a *App) saveTopicNode(w http.ResponseWriter, r *http.Request) {
+	topicID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	nodeID, _ := strconv.ParseInt(r.FormValue("node_id"), 10, 64)
+	title := strings.TrimSpace(r.FormValue("title"))
+	if topicID <= 0 || title == "" || utf8.RuneCountInString(title) > 120 {
+		http.Error(w, "文档标题不能为空且不能超过 120 个字符", http.StatusBadRequest)
+		return
+	}
+	node := TopicNode{ID: nodeID, TopicID: topicID, Title: title}
+	if raw := strings.TrimSpace(r.FormValue("parent_id")); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value <= 0 {
+			http.Error(w, "父级目录无效", http.StatusBadRequest)
+			return
+		}
+		node.ParentID = &value
+	}
+	if raw := strings.TrimSpace(r.FormValue("post_id")); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value <= 0 {
+			http.Error(w, "关联文章无效", http.StatusBadRequest)
+			return
+		}
+		node.PostID = &value
+	}
+	node.SortOrder, _ = strconv.Atoi(r.FormValue("sort_order"))
+	if err := a.store.SaveTopicNode(&node); err != nil {
+		http.Error(w, "文档保存失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.Contains(r.Header.Get("Accept"), "application/json") {
+		a.writeTopicTreeJSON(w, topicID, node.ID)
+		return
+	}
+	http.Redirect(w, r, "/admin/topics?node_saved=1#topic-"+strconv.FormatInt(topicID, 10), http.StatusSeeOther)
+}
+
+func (a *App) deleteTopicNode(w http.ResponseWriter, r *http.Request) {
+	topicID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	nodeID, _ := strconv.ParseInt(chi.URLParam(r, "nodeID"), 10, 64)
+	if topicID <= 0 || nodeID <= 0 || a.store.DeleteTopicNode(topicID, nodeID) != nil {
+		http.Error(w, "删除文档节点失败", http.StatusBadRequest)
+		return
+	}
+	if strings.Contains(r.Header.Get("Accept"), "application/json") {
+		a.writeTopicTreeJSON(w, topicID, 0)
+		return
+	}
+	http.Redirect(w, r, "/admin/topics?node_saved=1#topic-"+strconv.FormatInt(topicID, 10), http.StatusSeeOther)
+}
+
+func (a *App) writeTopicTreeJSON(w http.ResponseWriter, topicID, selectedID int64) {
+	nodes, err := a.store.TopicNodes(topicID, false)
+	if err != nil {
+		http.Error(w, "文档树刷新失败", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{"nodes": nodes, "selectedID": selectedID})
 }
 func (a *App) editPostPage(w http.ResponseWriter, r *http.Request) {
 	compose := chi.URLParam(r, "id")
