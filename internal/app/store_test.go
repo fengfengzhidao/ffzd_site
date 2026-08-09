@@ -44,8 +44,62 @@ func TestStoreAdminSessionAndMigration(t *testing.T) {
 		t.Fatalf("deleted session remains: %v", err)
 	}
 	var versions int
-	if err = s.DB.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 5 {
+	if err = s.DB.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 6 {
 		t.Fatalf("migration tracking failed: %d %v", versions, err)
+	}
+}
+
+func TestSearchPublicPostsAndFeedbackLifecycle(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SaveTaxonomy("tag", 0, "SQLite", "sqlite"); err != nil {
+		t.Fatal(err)
+	}
+	tags, err := s.Tags()
+	if err != nil {
+		t.Fatal(err)
+	}
+	matching := &Post{Title: "100% Go_指南", Slug: "literal-search", Markdown: "正文", HTML: "<p>正文</p>", Status: "published", IsVisible: true}
+	if err = s.SavePost(matching, []int64{tags[0].ID}); err != nil {
+		t.Fatal(err)
+	}
+	other := &Post{Title: "Go Web", Slug: "go-web", Markdown: "正文", HTML: "<p>正文</p>", Status: "published", IsVisible: true}
+	if err = s.SavePost(other, nil); err != nil {
+		t.Fatal(err)
+	}
+	hidden := &Post{Title: "100% Go_隐藏", Slug: "hidden-search", Markdown: "正文", HTML: "<p>正文</p>", Status: "published", IsVisible: false}
+	if err = s.SavePost(hidden, []int64{tags[0].ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	values, total, err := s.SearchPublicPosts(context.Background(), "% Go_", "sqlite", 1, 10)
+	if err != nil || total != 1 || len(values) != 1 || values[0].ID != matching.ID {
+		t.Fatalf("literal title and tag search failed: %#v %d %v", values, total, err)
+	}
+	values, total, err = s.SearchPublicPosts(context.Background(), "Go", "", 2, 1)
+	if err != nil || total != 2 || len(values) != 1 {
+		t.Fatalf("search pagination failed: %#v %d %v", values, total, err)
+	}
+
+	created, err := s.AddFeedback("访客", "visitor@example.com", "希望增加搜索")
+	if err != nil || created.ID == 0 || created.CreatedAt.IsZero() {
+		t.Fatalf("feedback add failed: %#v %v", created, err)
+	}
+	feedback, total, err := s.Feedback(1, 20)
+	if err != nil || total != 1 || len(feedback) != 1 || feedback[0].IsRead {
+		t.Fatalf("feedback list failed: %#v %d %v", feedback, total, err)
+	}
+	if err = s.SetFeedbackRead(created.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	feedback, _, _ = s.Feedback(1, 20)
+	if len(feedback) != 1 || !feedback[0].IsRead {
+		t.Fatalf("feedback read state was not updated: %#v", feedback)
+	}
+	if err = s.DeleteFeedback(created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, total, err = s.Feedback(1, 20); err != nil || total != 0 {
+		t.Fatalf("feedback delete failed: %d %v", total, err)
 	}
 }
 

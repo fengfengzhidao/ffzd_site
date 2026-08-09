@@ -1,4 +1,57 @@
+{{define "home_post_results"}}
+<div class="home-results-summary" aria-live="polite">
+  <span>{{if or .Query .ActiveTag}}找到 {{.Total}} 篇文章{{else}}共 {{.Total}} 篇文章{{end}}</span>
+  {{if or .Query .ActiveTag}}<a href="/" data-home-clear>清除筛选</a>{{end}}
+</div>
+{{if .Posts}}
+<div class="post-list">
+  {{range .Posts}}<article class="post-card with-cover home-post-card">
+    <a class="post-cover" href="/posts/{{postPath .}}" aria-label="阅读《{{.Title}}》">{{if .CoverURL}}<img src="{{.CoverURL}}" alt="" loading="lazy">{{else}}<span aria-hidden="true">暂无封面</span>{{end}}</a>
+    <div class="post-card-content">
+      <div class="meta">{{date .PublishedAt}}{{if .CategoryName}} · <a href="/categories/{{.CategorySlug}}">{{.CategoryName}}</a>{{end}}</div>
+      <h3><a href="/posts/{{postPath .}}">{{.Title}}</a></h3>
+      {{if .Summary}}<p>{{.Summary}}</p>{{end}}
+      <div class="tags">{{range .Tags}}<a href="/tags/{{.Slug}}">#{{.Name}}</a>{{end}}</div>
+    </div>
+  </article>{{end}}
+</div>
+{{if gt .TotalPages 1}}<nav class="pagination home-pagination" aria-label="首页文章分页">
+  {{range seq .TotalPages}}<a href="{{homeURL $.Query $.ActiveTag .}}" {{if eq . $.Page}}class="active" aria-current="page"{{end}} data-home-page="{{.}}">{{.}}</a>{{end}}
+</nav>{{end}}
+{{else}}<div class="empty home-empty">没有找到匹配的文章。</div>{{end}}
+{{end}}
+
 {{define "home.html"}}{{template "head" .}}{{template "public_nav" .}}<main>
-<section class="hero"><div class="container"><p class="eyebrow">个人技术博客</p><h1>{{.Settings.Tagline}}</h1><p>{{.Settings.Description}}</p><a class="button" href="/posts">浏览全部文章</a></div></section>
-<section class="container section"><div class="section-head"><h2>最新文章</h2><a href="/posts">查看全部 →</a></div>{{if .Posts}}<div class="post-list">{{range .Posts}}<article class="post-card with-cover home-post-card"><a class="post-cover" href="/posts/{{postPath .}}" aria-label="阅读《{{.Title}}》">{{if .CoverURL}}<img src="{{.CoverURL}}" alt="" loading="lazy">{{else}}<span aria-hidden="true">暂无封面</span>{{end}}</a><div class="post-card-content"><div class="meta">{{date .PublishedAt}}{{if .CategoryName}} · <a href="/categories/{{.CategorySlug}}">{{.CategoryName}}</a>{{end}}</div><h3><a href="/posts/{{postPath .}}">{{.Title}}</a></h3>{{if .Summary}}<p>{{.Summary}}</p>{{end}}<div class="tags">{{range .Tags}}<a href="/tags/{{.Slug}}">#{{.Name}}</a>{{end}}</div></div></article>{{end}}</div>{{else}}<div class="empty">还没有已发布的文章。</div>{{end}}</section>
-{{if .Categories}}<section class="container section"><h2>探索主题</h2><div class="chips">{{range .Categories}}{{if .Count}}<a href="/categories/{{.Slug}}">{{.Name}} <span>{{.Count}}</span></a>{{end}}{{end}}{{range .Tags}}{{if .Count}}<a href="/tags/{{.Slug}}">#{{.Name}} <span>{{.Count}}</span></a>{{end}}{{end}}</div></section>{{end}}</main>{{template "public_footer" .}}{{end}}
+<section class="hero"><div class="container"><p class="eyebrow">{{.Settings.SiteTitle}}</p><h1>{{.Settings.Tagline}}</h1><p>{{.Settings.Description}}</p><a class="button" href="/posts">浏览全部文章</a></div></section>
+<section class="container home-main" data-home-browser data-query="{{.Query}}" data-tag="{{.ActiveTag}}">
+  <div class="home-articles">
+    <div class="section-head home-article-head"><div><p class="eyebrow">内容</p><h2>最新文章</h2></div><a href="/posts">查看全部 →</a></div>
+    <form class="home-search" method="get" action="/" role="search" data-home-search-form>
+      <label for="home-search-input">搜索文章标题</label>
+      <div class="home-search-control"><input id="home-search-input" type="search" name="q" value="{{.Query}}" maxlength="100" placeholder="输入文章标题关键词" autocomplete="off" data-home-search-input>{{if .ActiveTag}}<input type="hidden" name="tag" value="{{.ActiveTag}}" data-home-tag-field>{{end}}<button type="submit">搜索</button></div>
+    </form>
+    <div data-home-results>{{template "home_post_results" .}}</div>
+  </div>
+  <aside class="home-sidebar" aria-label="站点侧栏">
+    <section class="panel sidebar-card site-info-card">
+      {{if .Settings.SiteIcon}}<img class="site-info-icon" src="{{.Settings.SiteIcon}}" alt="{{.Settings.SiteTitle}}图标">{{end}}
+      <p class="eyebrow">站点信息</p><h2>{{.Settings.SiteTitle}}</h2><p>{{.Settings.Description}}</p>{{if .Settings.Author}}<small>作者：{{.Settings.Author}}</small>{{end}}
+    </section>
+    <section class="panel sidebar-card tag-filter-card">
+      <div class="sidebar-card-head"><h2>标签列表</h2>{{if .ActiveTag}}<a href="{{homeURL .Query "" 1}}" data-home-tag="">全部</a>{{end}}</div>
+      {{if .Tags}}<div class="sidebar-tags">{{range .Tags}}{{if .Count}}<a href="{{homeURL $.Query .Slug 1}}" class="{{if eq .Slug $.ActiveTag}}active{{end}}" data-home-tag="{{.Slug}}" {{if eq .Slug $.ActiveTag}}aria-current="true"{{end}}><span>#{{.Name}}</span><em>{{.Count}}</em></a>{{end}}{{end}}</div>{{else}}<p class="muted">暂无标签。</p>{{end}}
+    </section>
+    <section class="panel sidebar-card feedback-card" id="feedback">
+      <p class="eyebrow">保持联系</p><h2>在线反馈</h2><p>有建议或想交流的内容，欢迎留言。</p>
+      {{if .Flash}}<div class="alert success feedback-status" role="status">{{.Flash}}</div>{{else}}<div class="feedback-status" data-feedback-status hidden></div>{{end}}
+      <form method="post" action="/feedback" data-feedback-form>
+        <label>姓名 <small>选填</small><input name="name" maxlength="50" autocomplete="name"></label>
+        <label>联系方式 <small>选填</small><input name="contact" maxlength="100" placeholder="邮箱、微信等"></label>
+        <label>反馈内容<textarea name="content" maxlength="1000" rows="5" required placeholder="请输入你的建议或问题"></textarea></label>
+        <label class="feedback-honeypot" aria-hidden="true">网站<input name="website" tabindex="-1" autocomplete="off"></label>
+        <button class="button full" type="submit">提交反馈</button>
+      </form>
+    </section>
+  </aside>
+</section>
+</main>{{template "public_footer" .}}{{end}}

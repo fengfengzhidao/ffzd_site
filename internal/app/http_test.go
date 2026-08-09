@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestApp(t *testing.T) *App {
@@ -386,5 +387,131 @@ func TestSettingsUploadSiteIcon(t *testing.T) {
 	icon := perform(a.server.Handler, http.MethodGet, settings.SiteIcon, nil)
 	if icon.Code != http.StatusOK || icon.Header().Get("Content-Type") != "image/png" {
 		t.Fatalf("saved icon is not publicly available: %d %q", icon.Code, icon.Header().Get("Content-Type"))
+	}
+}
+
+func TestHomeDynamicSearchAndFeedbackManagement(t *testing.T) {
+	a := newTestApp(t)
+	if err := a.store.SaveTaxonomy("tag", 0, "SQLite", "sqlite"); err != nil {
+		t.Fatal(err)
+	}
+	tags, _ := a.store.Tags()
+	matching := &Post{Title: "Go SQLite 实战", Slug: "go-sqlite", Markdown: "正文", HTML: "<p>正文</p>", Status: "published", IsVisible: true}
+	if err := a.store.SavePost(matching, []int64{tags[0].ID}); err != nil {
+		t.Fatal(err)
+	}
+	other := &Post{Title: "Go 网络编程", Slug: "go-network", Markdown: "正文", HTML: "<p>正文</p>", Status: "published", IsVisible: true}
+	if err := a.store.SavePost(other, nil); err != nil {
+		t.Fatal(err)
+	}
+	settings, _ := a.store.Settings()
+	settings.PostsPerPage = 1
+	if err := a.store.SaveSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	handler := a.server.Handler
+
+	home := perform(handler, http.MethodGet, "/", nil)
+	for _, expected := range []string{`class="container home-main"`, `data-home-search-input`, `class="home-sidebar"`, "站点信息", "标签列表", "在线反馈", `data-home-page="2"`} {
+		if home.Code != http.StatusOK || !strings.Contains(home.Body.String(), expected) {
+			t.Fatalf("home is missing %q: %d %s", expected, home.Code, home.Body.String())
+		}
+	}
+	filtered := perform(handler, http.MethodGet, "/?q=SQLite&tag=sqlite", nil)
+	if filtered.Code != http.StatusOK || !strings.Contains(filtered.Body.String(), "Go SQLite 实战") || strings.Contains(filtered.Body.String(), "Go 网络编程") || !strings.Contains(filtered.Body.String(), `value="SQLite"`) {
+		t.Fatalf("full home filtering failed: %d %s", filtered.Code, filtered.Body.String())
+	}
+	fragment := perform(handler, http.MethodGet, "/home/posts?q=SQLite&tag=sqlite", nil)
+	if fragment.Code != http.StatusOK || !strings.Contains(fragment.Body.String(), "Go SQLite 实战") || strings.Contains(fragment.Body.String(), "<html") {
+		t.Fatalf("home result fragment failed: %d %s", fragment.Code, fragment.Body.String())
+	}
+	tooLong := perform(handler, http.MethodGet, "/?q="+url.QueryEscape(strings.Repeat("长", 101)), nil)
+	if tooLong.Code != http.StatusBadRequest {
+		t.Fatalf("overlong search status = %d", tooLong.Code)
+	}
+
+	feedbackForm := url.Values{"name": {"访客"}, "contact": {"visitor@example.com"}, "content": {"这是一条私密反馈"}}
+	submitted := perform(handler, http.MethodPost, "/feedback", strings.NewReader(feedbackForm.Encode()))
+	if submitted.Code != http.StatusSeeOther || submitted.Header().Get("Location") != "/?feedback=saved#feedback" {
+		t.Fatalf("feedback submit failed: %d %s", submitted.Code, submitted.Body.String())
+	}
+	publicHome := perform(handler, http.MethodGet, "/", nil)
+	if strings.Contains(publicHome.Body.String(), "这是一条私密反馈") {
+		t.Fatal("private feedback leaked on the public home page")
+	}
+	honeypot := url.Values{"website": {"spam.example"}, "content": {"垃圾内容"}}
+	if response := perform(handler, http.MethodPost, "/feedback", strings.NewReader(honeypot.Encode())); response.Code != http.StatusSeeOther {
+		t.Fatalf("honeypot response = %d", response.Code)
+	}
+	feedback, total, err := a.store.Feedback(1, 20)
+	if err != nil || total != 1 || len(feedback) != 1 {
+		t.Fatalf("unexpected stored feedback: %#v %d %v", feedback, total, err)
+	}
+	if response := perform(handler, http.MethodPost, "/feedback", strings.NewReader(url.Values{"content": {""}}.Encode())); response.Code != http.StatusBadRequest {
+		t.Fatalf("empty feedback status = %d", response.Code)
+	}
+	if response := perform(handler, http.MethodGet, "/admin/feedback", nil); response.Code != http.StatusSeeOther {
+		t.Fatalf("anonymous admin feedback status = %d", response.Code)
+	}
+
+	admin, _ := a.store.Authenticate("admin", "very-strong-password")
+	token, csrf, err := a.store.CreateSession(admin.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &http.Cookie{Name: "session", Value: token}
+	adminPage := perform(handler, http.MethodGet, "/admin/feedback", nil, session)
+	if adminPage.Code != http.StatusOK || !strings.Contains(adminPage.Body.String(), "这是一条私密反馈") || !strings.Contains(adminPage.Body.String(), `class="admin-nav-link active" href="/admin/feedback"`) {
+		t.Fatalf("admin feedback page failed: %d %s", adminPage.Code, adminPage.Body.String())
+	}
+	withoutCSRF := perform(handler, http.MethodPost, fmt.Sprintf("/admin/feedback/%d/read", feedback[0].ID), strings.NewReader("is_read=1"), session)
+	if withoutCSRF.Code != http.StatusForbidden {
+		t.Fatalf("feedback update without CSRF status = %d", withoutCSRF.Code)
+	}
+	readForm := url.Values{"csrf": {csrf}, "is_read": {"1"}}
+	if response := perform(handler, http.MethodPost, fmt.Sprintf("/admin/feedback/%d/read", feedback[0].ID), strings.NewReader(readForm.Encode()), session); response.Code != http.StatusSeeOther {
+		t.Fatalf("feedback read update status = %d", response.Code)
+	}
+	deleteForm := url.Values{"csrf": {csrf}}
+	if response := perform(handler, http.MethodPost, fmt.Sprintf("/admin/feedback/%d/delete", feedback[0].ID), strings.NewReader(deleteForm.Encode()), session); response.Code != http.StatusSeeOther {
+		t.Fatalf("feedback delete status = %d", response.Code)
+	}
+}
+
+func TestSubmissionLimiter(t *testing.T) {
+	limiter := newSubmissionLimiter(2, time.Minute)
+	if !limiter.Allow("192.0.2.1") || !limiter.Allow("192.0.2.1") || limiter.Allow("192.0.2.1") {
+		t.Fatal("submission limiter did not enforce its limit")
+	}
+	if !limiter.Allow("192.0.2.2") {
+		t.Fatal("submission limiter mixed different clients")
+	}
+}
+
+func TestFeedbackAcceptsMultipartFormData(t *testing.T) {
+	a := newTestApp(t)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for key, value := range map[string]string{
+		"name": "千五", "contact": "2222", "content": "你好你",
+	} {
+		if err := writer.WriteField(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/feedback", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Accept", "application/json")
+	response := httptest.NewRecorder()
+	a.server.Handler.ServeHTTP(response, req)
+	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `"ok":true`) {
+		t.Fatalf("multipart feedback failed: %d %s", response.Code, response.Body.String())
+	}
+	feedback, total, err := a.store.Feedback(1, 20)
+	if err != nil || total != 1 || feedback[0].Name != "千五" || feedback[0].Contact != "2222" || feedback[0].Content != "你好你" {
+		t.Fatalf("multipart feedback was not stored: %#v %d %v", feedback, total, err)
 	}
 }

@@ -317,6 +317,119 @@ func (s *Store) ListPosts(ctx context.Context, public bool, filterKind, filterSl
 	return out, total, nil
 }
 
+func escapeLike(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(value)
+}
+
+func (s *Store) SearchPublicPosts(ctx context.Context, query, tagSlug string, page, perPage int) ([]Post, int, error) {
+	where := []string{"p.status='published'", "p.is_visible=1"}
+	args := []any{}
+	joins := ""
+	if query != "" {
+		where = append(where, `p.title LIKE ? ESCAPE '\' COLLATE NOCASE`)
+		args = append(args, "%"+escapeLike(query)+"%")
+	}
+	if tagSlug != "" {
+		joins = " JOIN post_tags ptf ON ptf.post_id=p.id JOIN tags tf ON tf.id=ptf.tag_id "
+		where = append(where, "tf.slug=?")
+		args = append(args, tagSlug)
+	}
+	cond := strings.Join(where, " AND ")
+	var total int
+	if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(DISTINCT p.id) FROM posts p "+joins+" WHERE "+cond, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	q := postSelect + joins + " WHERE " + cond + " GROUP BY p.id ORDER BY CASE WHEN p.published_at IS NULL THEN p.updated_at ELSE p.published_at END DESC LIMIT ? OFFSET ?"
+	queryArgs := append(append([]any{}, args...), perPage, (page-1)*perPage)
+	rows, err := s.DB.QueryContext(ctx, q, queryArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []Post
+	for rows.Next() {
+		post, scanErr := scanPost(rows)
+		if scanErr != nil {
+			return nil, 0, scanErr
+		}
+		out = append(out, post)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	for i := range out {
+		out[i].Tags, _ = s.PostTags(out[i].ID)
+	}
+	return out, total, nil
+}
+
+func (s *Store) AddFeedback(name, contact, content string) (Feedback, error) {
+	feedback := Feedback{Name: name, Contact: contact, Content: content}
+	result, err := s.DB.Exec("INSERT INTO feedback(name,contact,content) VALUES(?,?,?)", name, contact, content)
+	if err != nil {
+		return Feedback{}, err
+	}
+	feedback.ID, err = result.LastInsertId()
+	if err != nil {
+		return Feedback{}, err
+	}
+	err = s.DB.QueryRow("SELECT created_at FROM feedback WHERE id=?", feedback.ID).Scan(&feedback.CreatedAt)
+	return feedback, err
+}
+
+func (s *Store) Feedback(page, perPage int) ([]Feedback, int, error) {
+	var total int
+	if err := s.DB.QueryRow("SELECT COUNT(*) FROM feedback").Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.DB.Query("SELECT id,name,contact,content,is_read,created_at FROM feedback ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?", perPage, (page-1)*perPage)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var values []Feedback
+	for rows.Next() {
+		var value Feedback
+		var read int
+		if err = rows.Scan(&value.ID, &value.Name, &value.Contact, &value.Content, &read, &value.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		value.IsRead = read == 1
+		values = append(values, value)
+	}
+	return values, total, rows.Err()
+}
+
+func (s *Store) SetFeedbackRead(id int64, isRead bool) error {
+	result, err := s.DB.Exec("UPDATE feedback SET is_read=? WHERE id=?", isRead, id)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) DeleteFeedback(id int64) error {
+	result, err := s.DB.Exec("DELETE FROM feedback WHERE id=?", id)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *Store) SavePost(p *Post, tagIDs []int64) error {
 	tx, err := s.DB.Begin()
 	if err != nil {

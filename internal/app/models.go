@@ -32,6 +32,13 @@ type Tag struct {
 	Name, Slug string
 	Count      int
 }
+
+type Feedback struct {
+	ID                     int64
+	Name, Contact, Content string
+	IsRead                 bool
+	CreatedAt              time.Time
+}
 type Admin struct {
 	ID       int64
 	Username string

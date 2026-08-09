@@ -1,0 +1,12 @@
+{{define "admin_feedback.html"}}{{template "head" .}}<div class="admin-layout" data-admin-layout>{{template "admin_sidebar" .}}<div class="admin-workspace">{{template "admin_topbar" .}}<main class="container admin-page">
+  <header class="section-head"><div><p class="eyebrow">访客消息</p><h1>在线反馈</h1></div><span class="muted">共 {{.Total}} 条</span></header>
+  {{if .Flash}}<div class="alert success" role="status">{{.Flash}}</div>{{end}}
+  {{if .Feedbacks}}<div class="feedback-admin-list">{{range .Feedbacks}}<article class="panel feedback-admin-item{{if not .IsRead}} is-unread{{end}}">
+    <header><div><span class="status {{if .IsRead}}feedback-read{{else}}published{{end}}">{{if .IsRead}}已读{{else}}未读{{end}}</span><strong>{{if .Name}}{{.Name}}{{else}}匿名访客{{end}}</strong></div><time>{{formatTime .CreatedAt}}</time></header>
+    {{if .Contact}}<p class="feedback-contact">联系方式：{{.Contact}}</p>{{end}}
+    <p class="feedback-content">{{.Content}}</p>
+    <footer><form method="post" action="/admin/feedback/{{.ID}}/read"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="button secondary" type="submit" name="is_read" value="{{if .IsRead}}0{{else}}1{{end}}">{{if .IsRead}}标为未读{{else}}标为已读{{end}}</button></form><form method="post" action="/admin/feedback/{{.ID}}/delete" data-confirm="确定永久删除这条反馈吗？"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="danger" type="submit">删除</button></form></footer>
+  </article>{{end}}</div>
+  {{if gt .TotalPages 1}}<nav class="pagination" aria-label="反馈分页">{{range seq .TotalPages}}<a href="?page={{.}}" {{if eq . $.Page}}class="active" aria-current="page"{{end}}>{{.}}</a>{{end}}</nav>{{end}}
+  {{else}}<div class="empty panel">暂时还没有收到反馈。</div>{{end}}
+</main></div>{{template "admin_overlay" .}}</div><script src="/static/app.js" defer></script></body></html>{{end}}

@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -33,12 +34,13 @@ import (
 var webFS embed.FS
 
 type App struct {
-	cfg       Config
-	store     *Store
-	markdown  *MarkdownRenderer
-	templates *template.Template
-	server    *http.Server
-	limiter   *loginLimiter
+	cfg             Config
+	store           *Store
+	markdown        *MarkdownRenderer
+	templates       *template.Template
+	server          *http.Server
+	limiter         *loginLimiter
+	feedbackLimiter *submissionLimiter
 }
 
 type viewData struct {
@@ -49,10 +51,12 @@ type viewData struct {
 	Post                                                          *Post
 	Posts                                                         []Post
 	Covers                                                        []Cover
+	Feedbacks                                                     []Feedback
 	Categories                                                    []Category
 	Tags                                                          []Tag
 	Stats                                                         DashboardStats
-	Page, TotalPages                                              int
+	Page, TotalPages, Total                                       int
+	Query, ActiveTag                                              string
 	Now                                                           time.Time
 	JSONLD                                                        template.JS
 	ComposerOpen, InfoOpen                                        bool
@@ -104,13 +108,29 @@ func New(cfg Config) (*App, error) {
 			}
 			return strings.HasPrefix(current, target)
 		},
+		"homeURL": func(query, tag string, page int) string {
+			values := url.Values{}
+			if query != "" {
+				values.Set("q", query)
+			}
+			if tag != "" {
+				values.Set("tag", tag)
+			}
+			if page > 1 {
+				values.Set("page", strconv.Itoa(page))
+			}
+			if encoded := values.Encode(); encoded != "" {
+				return "/?" + encoded
+			}
+			return "/"
+		},
 	}
 	t, err := template.New("pages").Funcs(funcs).ParseFS(webFS, "templates/*.html")
 	if err != nil {
 		store.DB.Close()
 		return nil, err
 	}
-	a := &App{cfg: cfg, store: store, markdown: NewMarkdownRenderer(), templates: t, limiter: newLoginLimiter()}
+	a := &App{cfg: cfg, store: store, markdown: NewMarkdownRenderer(), templates: t, limiter: newLoginLimiter(), feedbackLimiter: newSubmissionLimiter(3, 10*time.Minute)}
 	a.server = &http.Server{Addr: cfg.Addr, Handler: a.routes(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	return a, nil
 }
@@ -135,6 +155,8 @@ func (a *App) routes() http.Handler {
 	}))
 	r.Handle("/uploads/*", http.StripPrefix("/uploads/", http.FileServer(http.Dir(a.cfg.UploadDir))))
 	r.Get("/", a.home)
+	r.Get("/home/posts", a.homePosts)
+	r.Post("/feedback", a.submitFeedback)
 	r.Get("/posts", a.posts)
 	r.Get("/posts/{slug}", a.postDetail)
 	r.Get("/categories/{slug}", a.categoryPosts)
@@ -159,6 +181,9 @@ func (a *App) routes() http.Handler {
 			r.Get("/covers", a.coversPage)
 			r.Post("/covers", a.addCover)
 			r.Post("/covers/{id}/delete", a.deleteCover)
+			r.Get("/feedback", a.adminFeedback)
+			r.Post("/feedback/{id}/read", a.setFeedbackRead)
+			r.Post("/feedback/{id}/delete", a.deleteFeedback)
 			r.Post("/preview", a.preview)
 			r.Post("/upload", a.upload)
 			r.Get("/settings", a.settingsPage)
@@ -219,10 +244,101 @@ func pages(total, per int) int {
 
 func (a *App) home(w http.ResponseWriter, r *http.Request) {
 	d := a.baseData(r, "", "")
-	d.Posts, _, _ = a.store.ListPosts(r.Context(), true, "", "", 1, 6)
-	d.Categories, _ = a.store.PublicCategories()
+	if !a.populateHomePosts(w, r, &d) {
+		return
+	}
 	d.Tags, _ = a.store.PublicTags()
+	if r.URL.Query().Get("feedback") == "saved" {
+		d.Flash = "感谢反馈，我们已经收到。"
+	}
 	a.render(w, r, "home.html", d, 200)
+}
+
+func (a *App) homePosts(w http.ResponseWriter, r *http.Request) {
+	d := a.baseData(r, "", "")
+	if !a.populateHomePosts(w, r, &d) {
+		return
+	}
+	a.render(w, r, "home_post_results", d, http.StatusOK)
+}
+
+func (a *App) populateHomePosts(w http.ResponseWriter, r *http.Request, d *viewData) bool {
+	d.Query = strings.TrimSpace(r.URL.Query().Get("q"))
+	d.ActiveTag = strings.TrimSpace(r.URL.Query().Get("tag"))
+	if utf8.RuneCountInString(d.Query) > 100 {
+		http.Error(w, "搜索词不能超过 100 个字符", http.StatusBadRequest)
+		return false
+	}
+	if utf8.RuneCountInString(d.ActiveTag) > 200 {
+		http.Error(w, "标签参数无效", http.StatusBadRequest)
+		return false
+	}
+	d.Page = pageOf(r)
+	posts, total, err := a.store.SearchPublicPosts(r.Context(), d.Query, d.ActiveTag, d.Page, d.Settings.PostsPerPage)
+	if err != nil {
+		http.Error(w, "文章加载失败", http.StatusInternalServerError)
+		return false
+	}
+	d.Total = total
+	d.TotalPages = pages(total, d.Settings.PostsPerPage)
+	if d.Page > d.TotalPages {
+		d.Page = d.TotalPages
+		posts, _, err = a.store.SearchPublicPosts(r.Context(), d.Query, d.ActiveTag, d.Page, d.Settings.PostsPerPage)
+		if err != nil {
+			http.Error(w, "文章加载失败", http.StatusInternalServerError)
+			return false
+		}
+	}
+	d.Posts = posts
+	return true
+}
+
+func (a *App) submitFeedback(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	var err error
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		err = r.ParseMultipartForm(16 << 10)
+	} else {
+		err = r.ParseForm()
+	}
+	if err != nil {
+		http.Error(w, "反馈内容过大", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(r.FormValue("website")) != "" {
+		a.feedbackSuccess(w, r)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	contact := strings.TrimSpace(r.FormValue("contact"))
+	content := strings.TrimSpace(r.FormValue("content"))
+	if content == "" {
+		http.Error(w, "请填写反馈内容", http.StatusBadRequest)
+		return
+	}
+	if utf8.RuneCountInString(name) > 50 || utf8.RuneCountInString(contact) > 100 || utf8.RuneCountInString(content) > 1000 {
+		http.Error(w, "反馈字段超过长度限制", http.StatusBadRequest)
+		return
+	}
+	if !a.feedbackLimiter.Allow(clientIP(r)) {
+		http.Error(w, "提交过于频繁，请稍后再试", http.StatusTooManyRequests)
+		return
+	}
+	if _, err := a.store.AddFeedback(name, contact, content); err != nil {
+		http.Error(w, "反馈提交失败", http.StatusInternalServerError)
+		return
+	}
+	a.feedbackSuccess(w, r)
+}
+
+func (a *App) feedbackSuccess(w http.ResponseWriter, r *http.Request) {
+	if strings.Contains(r.Header.Get("Accept"), "application/json") {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+		return
+	}
+	http.Redirect(w, r, "/?feedback=saved#feedback", http.StatusSeeOther)
 }
 func (a *App) posts(w http.ResponseWriter, r *http.Request) { a.renderPostList(w, r, "", "") }
 func (a *App) categoryPosts(w http.ResponseWriter, r *http.Request) {
@@ -583,6 +699,67 @@ func (a *App) coversPage(w http.ResponseWriter, r *http.Request) {
 	a.render(w, r, "admin_covers.html", d, http.StatusOK)
 }
 
+func (a *App) adminFeedback(w http.ResponseWriter, r *http.Request) {
+	d := a.baseData(r, "在线反馈", "")
+	d.Page = pageOf(r)
+	var err error
+	d.Feedbacks, d.Total, err = a.store.Feedback(d.Page, 20)
+	if err != nil {
+		http.Error(w, "反馈加载失败", http.StatusInternalServerError)
+		return
+	}
+	d.TotalPages = pages(d.Total, 20)
+	if d.Page > d.TotalPages {
+		d.Page = d.TotalPages
+		d.Feedbacks, _, err = a.store.Feedback(d.Page, 20)
+		if err != nil {
+			http.Error(w, "反馈加载失败", http.StatusInternalServerError)
+			return
+		}
+	}
+	switch r.URL.Query().Get("status") {
+	case "updated":
+		d.Flash = "反馈状态已更新"
+	case "deleted":
+		d.Flash = "反馈已删除"
+	}
+	a.render(w, r, "admin_feedback.html", d, http.StatusOK)
+}
+
+func (a *App) setFeedbackRead(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if id <= 0 {
+		http.Error(w, "无效反馈", http.StatusBadRequest)
+		return
+	}
+	if err := a.store.SetFeedbackRead(id, r.FormValue("is_read") == "1"); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			a.notFound(w, r)
+			return
+		}
+		http.Error(w, "状态更新失败", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin/feedback?status=updated", http.StatusSeeOther)
+}
+
+func (a *App) deleteFeedback(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if id <= 0 {
+		http.Error(w, "无效反馈", http.StatusBadRequest)
+		return
+	}
+	if err := a.store.DeleteFeedback(id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			a.notFound(w, r)
+			return
+		}
+		http.Error(w, "反馈删除失败", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin/feedback?status=deleted", http.StatusSeeOther)
+}
+
 func (a *App) addCover(w http.ResponseWriter, r *http.Request) {
 	source := ""
 	var coverURL string
@@ -744,6 +921,37 @@ type loginAttempt struct {
 	fails        int
 	blockedUntil time.Time
 }
+
+type submissionLimiter struct {
+	mu     sync.Mutex
+	items  map[string][]time.Time
+	limit  int
+	window time.Duration
+}
+
+func newSubmissionLimiter(limit int, window time.Duration) *submissionLimiter {
+	return &submissionLimiter{items: make(map[string][]time.Time), limit: limit, window: window}
+}
+
+func (l *submissionLimiter) Allow(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cutoff := time.Now().Add(-l.window)
+	attempts := l.items[ip]
+	kept := attempts[:0]
+	for _, attempt := range attempts {
+		if attempt.After(cutoff) {
+			kept = append(kept, attempt)
+		}
+	}
+	if len(kept) >= l.limit {
+		l.items[ip] = kept
+		return false
+	}
+	l.items[ip] = append(kept, time.Now())
+	return true
+}
+
 type loginLimiter struct {
 	mu    sync.Mutex
 	items map[string]loginAttempt
