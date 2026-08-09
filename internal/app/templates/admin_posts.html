@@ -1,2 +1,69 @@
-{{define "admin_post_table"}}{{if .Posts}}<div class="table-wrap"><table><thead><tr><th>标题</th><th>状态</th><th>分类</th><th>更新时间</th><th></th></tr></thead><tbody>{{range .Posts}}<tr><td><a href="/admin/posts/{{.ID}}">{{.Title}}</a><small>/{{.Slug}}</small></td><td><span class="status {{.Status}}">{{if eq .Status "published"}}已发布{{else}}草稿{{end}}</span></td><td>{{.CategoryName}}</td><td>{{formatTime .UpdatedAt}}</td><td><a href="/admin/posts/{{.ID}}">编辑</a></td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty">还没有文章。</div>{{end}}{{end}}
-{{define "admin_posts.html"}}{{template "head" .}}<div class="admin-layout" data-admin-layout>{{template "admin_sidebar" .}}<div class="admin-workspace">{{template "admin_topbar" .}}<main class="container admin-page"><div class="section-head"><div><p class="eyebrow">内容</p><h1>文章管理</h1></div><a class="button" href="/admin/posts/new">新增文章</a></div><section class="panel">{{template "admin_post_table" .}}</section></main></div>{{template "admin_overlay" .}}</div><script src="/static/app.js" defer></script></body></html>{{end}}
+{{define "admin_post_table"}}
+{{if .Posts}}<div class="table-wrap"><table class="post-admin-table"><thead><tr><th>标题</th><th>可见性</th><th>分类</th><th>更新时间</th><th></th></tr></thead><tbody>{{range .Posts}}<tr><td><a href="/admin/posts?compose={{.ID}}">{{.Title}}</a><small>/{{postPath .}}</small></td><td><form method="post" action="/admin/posts/{{.ID}}/visibility" class="visibility-form"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" name="is_visible" value="{{if .IsVisible}}0{{else}}1{{end}}" class="visibility-toggle{{if .IsVisible}} is-on{{end}}" role="switch" aria-checked="{{.IsVisible}}" aria-label="切换《{{.Title}}》的可见性"><span aria-hidden="true"></span><em>{{if .IsVisible}}可见{{else}}隐藏{{end}}</em></button></form></td><td>{{if .CategoryName}}{{.CategoryName}}{{else}}未分类{{end}}</td><td>{{formatTime .UpdatedAt}}</td><td><a href="/admin/posts?compose={{.ID}}">编辑</a></td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty">还没有文章。</div>{{end}}
+{{end}}
+
+{{define "post_composer"}}
+<div class="composer-layer{{if .ComposerOpen}} is-open{{end}}" data-composer-layer aria-hidden="{{if .ComposerOpen}}false{{else}}true{{end}}">
+  <button class="composer-backdrop" type="button" data-composer-close aria-label="关闭文章编辑器"></button>
+  <aside class="post-composer" role="dialog" aria-modal="true" aria-labelledby="composer-title">
+    <form method="post" action="{{if .Post.ID}}/admin/posts/{{.Post.ID}}{{else}}/admin/posts/new{{end}}" class="post-form" id="post-form" novalidate>
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="slug" value="{{.Post.Slug}}">
+      <header class="composer-header">
+        <h2 id="composer-title">{{if .Post.ID}}编辑文章{{else}}发布文章{{end}}</h2>
+        <button type="button" class="composer-close" data-composer-close aria-label="关闭">×</button>
+      </header>
+      <div class="editor-toolbar" role="toolbar" aria-label="Markdown 工具栏">
+        <button type="button" data-md-wrap="**" title="粗体"><strong>B</strong></button>
+        <button type="button" data-md-wrap="_" title="斜体"><em>I</em></button>
+        <button type="button" data-md-prefix="## " title="二级标题">H₂</button>
+        <button type="button" data-md-prefix="> " title="引用">❝</button>
+        <button type="button" data-md-prefix="- " title="无序列表">☷</button>
+        <button type="button" data-md-wrap="`" title="行内代码">&lt;/&gt;</button>
+        <button type="button" data-md-link title="链接">🔗</button>
+        <label class="editor-upload" title="上传图片">▧<input id="image-upload" type="file" accept="image/png,image/jpeg,image/gif,image/webp" hidden></label>
+        <span id="upload-status" class="editor-upload-status">支持 Markdown，图片上传后自动插入</span>
+      </div>
+      <div class="composer-editor">
+        <label class="sr-only" for="markdown-input">Markdown 正文</label>
+        <textarea id="markdown-input" name="markdown" data-csrf="{{.CSRF}}" placeholder="开始写作……" autofocus>{{.Post.Markdown}}</textarea>
+        <section class="composer-live-preview" aria-label="文章实时预览"><div id="markdown-preview" class="markdown-body"></div></section>
+      </div>
+      <footer class="composer-footer composer-main-footer">
+        <span class="editor-count" data-editor-count>字数：0</span>
+        <div class="composer-actions">
+          <button type="button" class="button secondary" data-composer-close>取消</button>
+          <button type="button" class="button info-button" data-info-open>完善信息</button>
+          <button type="submit" class="button" data-publish>{{if .Post.ID}}保存并发布{{else}}发布{{end}}</button>
+        </div>
+      </footer>
+
+      <div class="post-info-layer" data-info-layer aria-hidden="true">
+        <button class="post-info-backdrop" type="button" data-info-close aria-label="关闭文章信息"></button>
+        <section class="post-info-dialog" role="dialog" aria-modal="true" aria-labelledby="post-info-title">
+          <header><h3 id="post-info-title">文章信息</h3><button type="button" data-info-close aria-label="关闭">×</button></header>
+          <div class="post-info-body">
+            <p class="field-error" data-info-error hidden>请填写文章标题</p>
+            <label class="post-info-field"><span class="field-label">文章标题 <i aria-hidden="true">*</i></span><input name="title" value="{{.Post.Title}}" maxlength="200" placeholder="请输入文章标题"></label>
+            <label class="post-info-field"><span class="field-label">文章简介</span><textarea name="summary" rows="4" maxlength="500" placeholder="不填写时，自动取正文前 60 个字符">{{.Post.Summary}}</textarea><small>留空将自动从正文提取 60 个字符</small></label>
+            <label class="post-info-field"><span class="field-label">关键词</span><input name="keywords" value="{{.Post.Keywords}}" maxlength="300" placeholder="多个关键词可用逗号分隔"></label>
+            <label class="post-info-field"><span class="field-label">文章分类</span><input name="category_name" list="category-options" value="{{.Post.CategoryName}}" maxlength="80" placeholder="输入或选择分类"><datalist id="category-options">{{range .Categories}}<option value="{{.Name}}">{{end}}</datalist></label>
+            <label class="post-info-field"><span class="field-label">文章标签</span><div class="tag-combobox" data-tag-combobox data-initial-tags="{{tagNames .Post.Tags}}"><div class="tag-values" data-tag-values></div><input type="text" list="tag-options" data-tag-input placeholder="输入标签，按回车或逗号添加" autocomplete="off"><input type="hidden" name="new_tags" data-tag-hidden value="{{tagNames .Post.Tags}}"></div><datalist id="tag-options">{{range .Tags}}<option value="{{.Name}}">{{end}}</datalist></label>
+            <label class="visibility-choice"><input type="checkbox" name="is_visible" value="1" {{if .Post.IsVisible}}checked{{end}}><span><strong>文章可见</strong><small>关闭后文章仍会保存，但不会在前台显示</small></span></label>
+          </div>
+          <footer>
+            {{if .Post.ID}}<button class="danger" type="submit" form="delete-post-form">永久删除</button>{{end}}
+            <span class="info-footer-spacer"></span>
+            <button type="button" class="button secondary" data-info-close>取消</button>
+            <button type="button" class="button" data-info-save>确定</button>
+            <button type="submit" class="button info-publish" data-info-publish>直接发布</button>
+          </footer>
+        </section>
+      </div>
+    </form>
+    {{if .Post.ID}}<form id="delete-post-form" method="post" action="/admin/posts/{{.Post.ID}}/delete" data-confirm="确定永久删除这篇文章吗？图片文件不会自动删除。"><input type="hidden" name="csrf" value="{{.CSRF}}"></form>{{end}}
+  </aside>
+</div>
+{{end}}
+
+{{define "admin_posts.html"}}{{template "head" .}}<div class="admin-layout" data-admin-layout>{{template "admin_sidebar" .}}<div class="admin-workspace">{{template "admin_topbar" .}}<main class="container admin-page"><div class="section-head"><div><p class="eyebrow">内容</p><h1>文章管理</h1></div><a class="button" href="/admin/posts?compose=new" data-new-composer>发布文章</a></div>{{if .Flash}}<div class="alert success" role="status">{{.Flash}}</div>{{end}}<section class="panel">{{template "admin_post_table" .}}</section></main></div>{{template "admin_overlay" .}}</div>{{template "post_composer" .}}<script src="/static/app.js" defer></script></body></html>{{end}}

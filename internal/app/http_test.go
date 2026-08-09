@@ -37,25 +37,38 @@ func perform(handler http.Handler, method, path string, body io.Reader, cookies 
 	return rec
 }
 
-func TestPublicRoutesHideDraftAndExposeSEO(t *testing.T) {
+func TestPublicRoutesHideInvisiblePostsAndExposeSEO(t *testing.T) {
 	a := newTestApp(t)
-	pub := &Post{Title: "公开文章", Slug: "public", Summary: "用于 SEO", Markdown: "# 正文", HTML: "<h1>正文</h1>", Status: "published"}
+	pub := &Post{Title: "公开文章", Slug: "public", Summary: "用于 SEO", Keywords: "Go,测试", Markdown: "# 正文", HTML: "<h1>正文</h1>", Status: "published", IsVisible: true}
 	if err := a.store.SavePost(pub, nil); err != nil {
 		t.Fatal(err)
 	}
-	draft := &Post{Title: "草稿", Slug: "draft", Markdown: "hidden", HTML: "<p>hidden</p>", Status: "draft"}
-	if err := a.store.SavePost(draft, nil); err != nil {
+	hidden := &Post{Title: "隐藏文章", Slug: "hidden", Markdown: "hidden", HTML: "<p>hidden</p>", Status: "published", IsVisible: false}
+	if err := a.store.SavePost(hidden, nil); err != nil {
 		t.Fatal(err)
 	}
 	handler := a.server.Handler
 	res := perform(handler, "GET", "/posts/public", nil)
-	if res.Code != 200 || !strings.Contains(res.Body.String(), "公开文章") || !strings.Contains(res.Body.String(), "application/ld+json") {
+	if res.Code != 200 || !strings.Contains(res.Body.String(), "公开文章") || !strings.Contains(res.Body.String(), "application/ld+json") || !strings.Contains(res.Body.String(), `content="Go,测试"`) {
 		t.Fatalf("published page failed: %d %s", res.Code, res.Body.String())
 	}
-	if res = perform(handler, "GET", "/posts/draft", nil); res.Code != 404 {
-		t.Fatalf("draft status = %d", res.Code)
+	if res = perform(handler, "GET", "/posts/hidden", nil); res.Code != 404 {
+		t.Fatalf("hidden post status = %d", res.Code)
 	}
-	if res = perform(handler, "GET", "/sitemap.xml", nil); res.Code != 200 || !strings.Contains(res.Body.String(), "/posts/public") || strings.Contains(res.Body.String(), "/posts/draft") {
+	if res = perform(handler, "GET", "/posts/public", nil); res.Code != 200 {
+		t.Fatalf("legacy slug status = %d", res.Code)
+	}
+	keywordPost := &Post{Title: "GPT 发布说明", Slug: "old-gpt-title", Keywords: "gpt-5.6, Codex", Markdown: "正文", HTML: "<p>正文</p>", Status: "published", IsVisible: true}
+	if err := a.store.SavePost(keywordPost, nil); err != nil {
+		t.Fatal(err)
+	}
+	if res = perform(handler, "GET", "/posts/gpt5.6", nil); res.Code != 200 || !strings.Contains(res.Body.String(), "GPT 发布说明") {
+		t.Fatalf("keyword URL failed: %d %s", res.Code, res.Body.String())
+	}
+	if res = perform(handler, "GET", "/posts", nil); res.Code != 200 || !strings.Contains(res.Body.String(), `href="/posts/gpt5.6"`) || strings.Contains(res.Body.String(), `href="/posts/old-gpt-title"`) {
+		t.Fatalf("article list did not use keyword URL: %d %s", res.Code, res.Body.String())
+	}
+	if res = perform(handler, "GET", "/sitemap.xml", nil); res.Code != 200 || !strings.Contains(res.Body.String(), "/posts/go") || !strings.Contains(res.Body.String(), "/posts/gpt5.6") || strings.Contains(res.Body.String(), "/posts/public") || strings.Contains(res.Body.String(), "/posts/hidden") || strings.Contains(res.Body.String(), "/posts/old-gpt-title") {
 		t.Fatalf("bad sitemap: %s", res.Body.String())
 	}
 	if res = perform(handler, "GET", "/admin/", nil); res.Code != http.StatusSeeOther {
@@ -111,21 +124,34 @@ func TestLoginCSRFAndAuthenticatedDashboard(t *testing.T) {
 		t.Fatal("standalone taxonomy navigation should be removed")
 	}
 
-	formPage := perform(handler, "GET", "/admin/posts/new", nil, session)
-	if formPage.Code != 200 || !strings.Contains(formPage.Body.String(), `name="new_category"`) || !strings.Contains(formPage.Body.String(), `name="new_tags"`) {
-		t.Fatalf("inline taxonomy fields are missing: %d", formPage.Code)
+	formPage := perform(handler, "GET", "/admin/posts?compose=new", nil, session)
+	if formPage.Code != 200 || !strings.Contains(formPage.Body.String(), `name="category_name"`) || !strings.Contains(formPage.Body.String(), `data-tag-combobox`) || !strings.Contains(formPage.Body.String(), `class="composer-layer is-open"`) {
+		t.Fatalf("drawer taxonomy fields are missing: %d", formPage.Code)
+	}
+	for _, expected := range []string{`data-info-open`, `name="keywords"`, `data-info-layer`, `data-editor-count`, `composer-live-preview`, "自动从正文提取 60 个字符"} {
+		if !strings.Contains(formPage.Body.String(), expected) {
+			t.Fatalf("two-step editor is missing %q", expected)
+		}
+	}
+	if strings.Contains(formPage.Body.String(), "保存为草稿") || strings.Contains(formPage.Body.String(), `name="status"`) {
+		t.Fatal("draft controls should not exist in the article composer")
+	}
+	legacyFormPage := perform(handler, "GET", "/admin/posts/new", nil, session)
+	if legacyFormPage.Code != http.StatusSeeOther || legacyFormPage.Header().Get("Location") != "/admin/posts?compose=new" {
+		t.Fatalf("legacy editor route should redirect to drawer: %d %s", legacyFormPage.Code, legacyFormPage.Header().Get("Location"))
 	}
 	storedSession, err := a.store.GetSession(session.Value)
 	if err != nil {
 		t.Fatal(err)
 	}
 	postForm := url.Values{
-		"csrf":         {storedSession.CSRF},
-		"title":        {"内联分类测试"},
-		"markdown":     {"正文"},
-		"status":       {"draft"},
-		"new_category": {"新分类"},
-		"new_tags":     {"标签一，标签二, 标签一"},
+		"csrf":          {storedSession.CSRF},
+		"title":         {"内联分类测试"},
+		"markdown":      {"正文"},
+		"keywords":      {"Go-1.26, SQLite"},
+		"is_visible":    {"1"},
+		"category_name": {"新分类"},
+		"new_tags":      {"标签一，标签二, 标签一"},
 	}
 	savedPost := perform(handler, "POST", "/admin/posts/new", strings.NewReader(postForm.Encode()), session)
 	if savedPost.Code != http.StatusSeeOther {
@@ -135,6 +161,42 @@ func TestLoginCSRFAndAuthenticatedDashboard(t *testing.T) {
 	tags, _ := a.store.Tags()
 	if len(categories) != 1 || categories[0].Name != "新分类" || len(tags) != 2 {
 		t.Fatalf("inline taxonomies were not created: %#v %#v", categories, tags)
+	}
+	saved, err := a.store.PostByID(1)
+	if err != nil || saved.Status != "published" || !saved.IsVisible || saved.Summary != "正文" || saved.Keywords != "Go-1.26, SQLite" || saved.Slug != "go1.26" {
+		t.Fatalf("new article should be published and visible by default: %#v %v", saved, err)
+	}
+	editPage := perform(handler, "GET", "/admin/posts?compose=1", nil, session)
+	if editPage.Code != http.StatusOK || !strings.Contains(editPage.Body.String(), "编辑文章") || !strings.Contains(editPage.Body.String(), "内联分类测试") {
+		t.Fatalf("edit composer did not load saved post: %d", editPage.Code)
+	}
+	editForm := url.Values{
+		"csrf":       {storedSession.CSRF},
+		"title":      {"内联分类测试（已编辑）"},
+		"slug":       {saved.Slug},
+		"markdown":   {"更新后的正文"},
+		"keywords":   {"Go-1.26, SQLite"},
+		"is_visible": {"1"},
+	}
+	updatedPost := perform(handler, "POST", "/admin/posts/1", strings.NewReader(editForm.Encode()), session)
+	if updatedPost.Code != http.StatusSeeOther {
+		t.Fatalf("post update failed: %d %s", updatedPost.Code, updatedPost.Body.String())
+	}
+	updated, err := a.store.PostByID(1)
+	if err != nil || updated.Slug != "go1.26" {
+		t.Fatalf("published slug changed while editing: %#v %v", updated, err)
+	}
+	newPage := perform(handler, "GET", "/admin/posts?compose=new", nil, session)
+	if newPage.Code != http.StatusOK || !strings.Contains(newPage.Body.String(), "发布文章") || !strings.Contains(newPage.Body.String(), `data-new-composer`) || !strings.Contains(newPage.Body.String(), `action="/admin/posts/new"`) || !strings.Contains(newPage.Body.String(), `class="post-info-field"`) || strings.Contains(newPage.Body.String(), `value="内联分类测试"`) || strings.Contains(newPage.Body.String(), `>正文</textarea>`) {
+		t.Fatalf("new composer retained edit state: %d %s", newPage.Code, newPage.Body.String())
+	}
+	toggle := url.Values{"csrf": {storedSession.CSRF}, "is_visible": {"0"}}
+	toggled := perform(handler, "POST", "/admin/posts/1/visibility", strings.NewReader(toggle.Encode()), session)
+	if toggled.Code != http.StatusSeeOther {
+		t.Fatalf("visibility toggle failed: %d", toggled.Code)
+	}
+	if public := perform(handler, "GET", "/posts/内联分类测试", nil); public.Code != http.StatusNotFound {
+		t.Fatalf("hidden article leaked publicly: %d", public.Code)
 	}
 
 	removedPage := perform(handler, "GET", "/admin/taxonomies", nil, session)
@@ -229,7 +291,7 @@ func TestSettingsUploadSiteIcon(t *testing.T) {
 		t.Fatalf("favicon link missing from public page: %d", home.Code)
 	}
 	dashboard := perform(a.server.Handler, http.MethodGet, "/admin/", nil, &http.Cookie{Name: "session", Value: token})
-	if dashboard.Code != http.StatusOK || !strings.Contains(dashboard.Body.String(), `<span class="admin-brand-mark"><img src="`+settings.SiteIcon+`"`) {
+	if dashboard.Code != http.StatusOK || !strings.Contains(dashboard.Body.String(), `<span class="admin-brand-mark has-image"><img src="`+settings.SiteIcon+`"`) {
 		t.Fatalf("site icon missing from admin brand: %d", dashboard.Code)
 	}
 	icon := perform(a.server.Handler, http.MethodGet, settings.SiteIcon, nil)

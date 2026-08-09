@@ -54,6 +54,7 @@ type viewData struct {
 	Page, TotalPages                                              int
 	Now                                                           time.Time
 	JSONLD                                                        template.JS
+	ComposerOpen                                                  bool
 }
 
 type contextKey string
@@ -78,15 +79,14 @@ func New(cfg Config) (*App, error) {
 		},
 		"formatTime": func(t time.Time) string { return t.Local().Format("2006-01-02 15:04") },
 		"safeHTML":   func(s string) template.HTML { return template.HTML(s) },
-		"containsTag": func(tags []Tag, id int64) bool {
-			for _, t := range tags {
-				if t.ID == id {
-					return true
-				}
+		"postPath":   PublicPostPath,
+		"tagNames": func(tags []Tag) string {
+			names := make([]string, 0, len(tags))
+			for _, tag := range tags {
+				names = append(names, tag.Name)
 			}
-			return false
+			return strings.Join(names, ", ")
 		},
-		"eqID": func(id *int64, v int64) bool { return id != nil && *id == v },
 		"seq": func(n int) []int {
 			v := make([]int, n)
 			for i := range v {
@@ -145,6 +145,7 @@ func (a *App) routes() http.Handler {
 			r.Post("/posts/new", a.savePost)
 			r.Get("/posts/{id}", a.editPostPage)
 			r.Post("/posts/{id}", a.savePost)
+			r.Post("/posts/{id}/visibility", a.togglePostVisibility)
 			r.Post("/posts/{id}/delete", a.deletePost)
 			r.Post("/preview", a.preview)
 			r.Post("/upload", a.upload)
@@ -235,7 +236,7 @@ func (a *App) renderPostList(w http.ResponseWriter, r *http.Request, kind, slug 
 	a.render(w, r, "posts.html", d, 200)
 }
 func (a *App) postDetail(w http.ResponseWriter, r *http.Request) {
-	p, err := a.store.PublishedBySlug(chi.URLParam(r, "slug"))
+	p, err := a.store.PublishedByPath(chi.URLParam(r, "slug"))
 	if err != nil {
 		a.notFound(w, r)
 		return
@@ -246,7 +247,7 @@ func (a *App) postDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	d := a.baseData(r, p.Title, desc)
 	d.Post = &p
-	payload, _ := json.Marshal(map[string]any{"@context": "https://schema.org", "@type": "BlogPosting", "headline": p.Title, "description": desc, "datePublished": p.PublishedAt, "dateModified": p.UpdatedAt, "author": map[string]string{"@type": "Person", "name": d.Settings.Author}})
+	payload, _ := json.Marshal(map[string]any{"@context": "https://schema.org", "@type": "BlogPosting", "headline": p.Title, "description": desc, "keywords": p.Keywords, "datePublished": p.PublishedAt, "dateModified": p.UpdatedAt, "author": map[string]string{"@type": "Person", "name": d.Settings.Author}})
 	d.JSONLD = template.JS(payload)
 	a.render(w, r, "post.html", d, 200)
 }
@@ -372,23 +373,31 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 func (a *App) adminPosts(w http.ResponseWriter, r *http.Request) {
 	d := a.baseData(r, "文章管理", "")
 	d.Posts, _, _ = a.store.ListPosts(r.Context(), false, "", "", 1, 100)
+	d.Categories, _ = a.store.Categories()
+	d.Tags, _ = a.store.Tags()
+	d.Post = &Post{Status: "published", IsVisible: true}
+	if r.URL.Query().Get("saved") == "1" {
+		d.Flash = "文章已保存"
+	}
+	if compose := r.URL.Query().Get("compose"); compose != "" {
+		d.ComposerOpen = true
+		if id, _ := strconv.ParseInt(compose, 10, 64); id > 0 {
+			p, err := a.store.PostByID(id)
+			if err != nil {
+				a.notFound(w, r)
+				return
+			}
+			d.Post = &p
+		}
+	}
 	a.render(w, r, "admin_posts.html", d, 200)
 }
 func (a *App) editPostPage(w http.ResponseWriter, r *http.Request) {
-	d := a.baseData(r, "编辑文章", "")
-	d.Categories, _ = a.store.Categories()
-	d.Tags, _ = a.store.Tags()
-	if id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64); id > 0 {
-		p, e := a.store.PostByID(id)
-		if e != nil {
-			a.notFound(w, r)
-			return
-		}
-		d.Post = &p
-	} else {
-		d.Post = &Post{Status: "draft"}
+	compose := chi.URLParam(r, "id")
+	if compose == "" {
+		compose = "new"
 	}
-	a.render(w, r, "post_form.html", d, 200)
+	http.Redirect(w, r, "/admin/posts?compose="+url.QueryEscape(compose), http.StatusSeeOther)
 }
 func (a *App) savePost(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
@@ -401,34 +410,26 @@ func (a *App) savePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "标题不能为空", 400)
 		return
 	}
+	keywords := strings.TrimSpace(r.FormValue("keywords"))
 	slug := strings.TrimSpace(r.FormValue("slug"))
 	if old.PublishedAt != nil {
 		slug = old.Slug
-	} else if slug == "" {
-		slug = title
-	}
-	slug = UniqueSlug(slug, func(v string) bool { return a.store.SlugExists(v, id) })
-	status := r.FormValue("status")
-	if status != "published" {
-		status = "draft"
+	} else if keywordSlug := KeywordSlug(keywords); keywordSlug != "" {
+		slug = UniqueKeywordSlug(keywordSlug, func(v string) bool { return a.store.SlugExists(v, id) })
+	} else {
+		slug = UniqueSlug(title, func(v string) bool { return a.store.SlugExists(v, id) })
 	}
 	html, err := a.markdown.Render(r.FormValue("markdown"))
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	var cid *int64
-	if x, _ := strconv.ParseInt(r.FormValue("category_id"), 10, 64); x > 0 {
-		cid = &x
+	summary := strings.TrimSpace(r.FormValue("summary"))
+	if summary == "" {
+		summary = PlainTextSummary(html, 60)
 	}
-	p := Post{ID: id, Title: title, Slug: slug, Summary: strings.TrimSpace(r.FormValue("summary")), Markdown: r.FormValue("markdown"), HTML: html, Status: status, CategoryID: cid, PublishedAt: old.PublishedAt}
-	var tagIDs []int64
-	for _, v := range r.Form["tag_ids"] {
-		if x, e := strconv.ParseInt(v, 10, 64); e == nil {
-			tagIDs = append(tagIDs, x)
-		}
-	}
-	newCategory := strings.TrimSpace(r.FormValue("new_category"))
+	p := Post{ID: id, Title: title, Slug: slug, Summary: summary, Keywords: keywords, Markdown: r.FormValue("markdown"), HTML: html, Status: "published", IsVisible: r.FormValue("is_visible") == "1", PublishedAt: old.PublishedAt}
+	newCategory := strings.TrimSpace(r.FormValue("category_name"))
 	if utf8.RuneCountInString(newCategory) > 80 {
 		http.Error(w, "新分类名称不能超过 80 个字符", 400)
 		return
@@ -438,15 +439,28 @@ func (a *App) savePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	if len(tagIDs)+len(newTags) > 30 {
+	if len(newTags) > 30 {
 		http.Error(w, "每篇文章最多选择 30 个标签", 400)
 		return
 	}
-	if err = a.store.SavePostWithTaxonomies(&p, tagIDs, newCategory, newTags); err != nil {
+	if err = a.store.SavePostWithTaxonomies(&p, nil, newCategory, newTags); err != nil {
 		http.Error(w, "保存失败: "+err.Error(), 400)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/admin/posts/%d?saved=1", p.ID), 303)
+	http.Redirect(w, r, "/admin/posts?saved=1", 303)
+}
+
+func (a *App) togglePostVisibility(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if id <= 0 {
+		http.Error(w, "无效文章", http.StatusBadRequest)
+		return
+	}
+	if err := a.store.SetPostVisibility(id, r.FormValue("is_visible") == "1"); err != nil {
+		http.Error(w, "更新可见性失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "/admin/posts", http.StatusSeeOther)
 }
 
 func parseNewTagNames(raw string) ([]string, error) {

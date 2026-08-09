@@ -197,7 +197,9 @@ func scanPost(row interface{ Scan(...any) error }) (Post, error) {
 	var catID sql.NullInt64
 	var catName, catSlug sql.NullString
 	var pub sql.NullTime
-	err := row.Scan(&p.ID, &p.Title, &p.Slug, &p.Summary, &p.Markdown, &p.HTML, &p.Status, &catID, &catName, &catSlug, &pub, &p.CreatedAt, &p.UpdatedAt)
+	var visible int
+	err := row.Scan(&p.ID, &p.Title, &p.Slug, &p.Summary, &p.Keywords, &p.Markdown, &p.HTML, &p.Status, &visible, &catID, &catName, &catSlug, &pub, &p.CreatedAt, &p.UpdatedAt)
+	p.IsVisible = visible == 1
 	if catID.Valid {
 		p.CategoryID = &catID.Int64
 	}
@@ -209,7 +211,7 @@ func scanPost(row interface{ Scan(...any) error }) (Post, error) {
 	return p, err
 }
 
-const postSelect = `SELECT p.id,p.title,p.slug,p.summary,p.markdown,p.html,p.status,p.category_id,c.name,c.slug,p.published_at,p.created_at,p.updated_at FROM posts p LEFT JOIN categories c ON c.id=p.category_id`
+const postSelect = `SELECT p.id,p.title,p.slug,p.summary,p.keywords,p.markdown,p.html,p.status,p.is_visible,p.category_id,c.name,c.slug,p.published_at,p.created_at,p.updated_at FROM posts p LEFT JOIN categories c ON c.id=p.category_id`
 
 func (s *Store) PostByID(id int64) (Post, error) {
 	p, e := scanPost(s.DB.QueryRow(postSelect+" WHERE p.id=?", id))
@@ -219,11 +221,46 @@ func (s *Store) PostByID(id int64) (Post, error) {
 	return p, e
 }
 func (s *Store) PublishedBySlug(slug string) (Post, error) {
-	p, e := scanPost(s.DB.QueryRow(postSelect+" WHERE p.slug=? AND p.status='published'", slug))
+	p, e := scanPost(s.DB.QueryRow(postSelect+" WHERE p.slug=? AND p.status='published' AND p.is_visible=1", slug))
 	if e == nil {
 		p.Tags, _ = s.PostTags(p.ID)
 	}
 	return p, e
+}
+
+// PublishedByPath accepts the legacy stored slug and the URL form of an
+// article's first keyword. Keeping the old slug lookup prevents existing
+// published links from breaking after keyword URLs were introduced.
+func (s *Store) PublishedByPath(path string) (Post, error) {
+	p, err := s.PublishedBySlug(path)
+	if err == nil || err != sql.ErrNoRows {
+		return p, err
+	}
+	rows, err := s.DB.Query(postSelect + " WHERE p.status='published' AND p.is_visible=1 AND p.keywords<>''")
+	if err != nil {
+		return Post{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		p, err = scanPost(rows)
+		if err != nil {
+			return Post{}, err
+		}
+		if KeywordSlug(p.Keywords) == path {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return Post{}, err
+	}
+	if p.ID != 0 && KeywordSlug(p.Keywords) == path {
+		if err := rows.Close(); err != nil {
+			return Post{}, err
+		}
+		p.Tags, _ = s.PostTags(p.ID)
+		return p, nil
+	}
+	return Post{}, sql.ErrNoRows
 }
 
 func (s *Store) ListPosts(ctx context.Context, public bool, filterKind, filterSlug string, page, perPage int) ([]Post, int, error) {
@@ -231,7 +268,7 @@ func (s *Store) ListPosts(ctx context.Context, public bool, filterKind, filterSl
 	args := []any{}
 	joins := ""
 	if public {
-		where = append(where, "p.status='published'")
+		where = append(where, "p.status='published'", "p.is_visible=1")
 	}
 	if filterKind == "category" {
 		where = append(where, "c.slug=?")
@@ -373,13 +410,13 @@ func savePostTx(tx *sql.Tx, p *Post, tagIDs []int64) error {
 		pub = now
 	}
 	if p.ID == 0 {
-		r, e := tx.Exec(`INSERT INTO posts(title,slug,summary,markdown,html,status,category_id,published_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, p.Title, p.Slug, p.Summary, p.Markdown, p.HTML, p.Status, p.CategoryID, pub, time.Now())
+		r, e := tx.Exec(`INSERT INTO posts(title,slug,summary,keywords,markdown,html,status,is_visible,category_id,published_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, p.Title, p.Slug, p.Summary, p.Keywords, p.Markdown, p.HTML, p.Status, p.IsVisible, p.CategoryID, pub, time.Now())
 		if e != nil {
 			return e
 		}
 		p.ID, _ = r.LastInsertId()
 	} else {
-		_, err := tx.Exec(`UPDATE posts SET title=?,slug=?,summary=?,markdown=?,html=?,status=?,category_id=?,published_at=?,updated_at=? WHERE id=?`, p.Title, p.Slug, p.Summary, p.Markdown, p.HTML, p.Status, p.CategoryID, pub, time.Now(), p.ID)
+		_, err := tx.Exec(`UPDATE posts SET title=?,slug=?,summary=?,keywords=?,markdown=?,html=?,status=?,is_visible=?,category_id=?,published_at=?,updated_at=? WHERE id=?`, p.Title, p.Slug, p.Summary, p.Keywords, p.Markdown, p.HTML, p.Status, p.IsVisible, p.CategoryID, pub, time.Now(), p.ID)
 		if err != nil {
 			return err
 		}
@@ -397,6 +434,20 @@ func savePostTx(tx *sql.Tx, p *Post, tagIDs []int64) error {
 func (s *Store) DeletePost(id int64) error {
 	_, err := s.DB.Exec("DELETE FROM posts WHERE id=?", id)
 	return err
+}
+func (s *Store) SetPostVisibility(id int64, visible bool) error {
+	result, err := s.DB.Exec("UPDATE posts SET is_visible=?,updated_at=? WHERE id=?", visible, time.Now(), id)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 func (s *Store) SlugExists(slug string, except int64) bool {
 	var n int
@@ -454,7 +505,7 @@ func (s *Store) Tags() ([]Tag, error) {
 }
 
 func (s *Store) PublicCategories() ([]Category, error) {
-	rows, err := s.DB.Query(`SELECT c.id,c.name,c.slug,COUNT(p.id) FROM categories c LEFT JOIN posts p ON p.category_id=c.id AND p.status='published' GROUP BY c.id ORDER BY c.name`)
+	rows, err := s.DB.Query(`SELECT c.id,c.name,c.slug,COUNT(p.id) FROM categories c LEFT JOIN posts p ON p.category_id=c.id AND p.status='published' AND p.is_visible=1 GROUP BY c.id ORDER BY c.name`)
 	if err != nil {
 		return nil, err
 	}
@@ -471,7 +522,7 @@ func (s *Store) PublicCategories() ([]Category, error) {
 }
 
 func (s *Store) PublicTags() ([]Tag, error) {
-	rows, err := s.DB.Query(`SELECT t.id,t.name,t.slug,COUNT(p.id) FROM tags t LEFT JOIN post_tags pt ON pt.tag_id=t.id LEFT JOIN posts p ON p.id=pt.post_id AND p.status='published' GROUP BY t.id ORDER BY t.name`)
+	rows, err := s.DB.Query(`SELECT t.id,t.name,t.slug,COUNT(p.id) FROM tags t LEFT JOIN post_tags pt ON pt.tag_id=t.id LEFT JOIN posts p ON p.id=pt.post_id AND p.status='published' AND p.is_visible=1 GROUP BY t.id ORDER BY t.name`)
 	if err != nil {
 		return nil, err
 	}
@@ -508,20 +559,22 @@ func (s *Store) DeleteTaxonomy(kind string, id int64) error {
 }
 func (s *Store) Stats() (DashboardStats, error) {
 	var v DashboardStats
-	e := s.DB.QueryRow(`SELECT COUNT(*),COALESCE(SUM(CASE WHEN status='draft' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN status='published' THEN 1 ELSE 0 END),0) FROM posts`).Scan(&v.Total, &v.Drafts, &v.Published)
+	e := s.DB.QueryRow(`SELECT COUNT(*),COALESCE(SUM(CASE WHEN is_visible=0 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN is_visible=1 THEN 1 ELSE 0 END),0) FROM posts`).Scan(&v.Total, &v.Hidden, &v.Visible)
 	return v, e
 }
 func (s *Store) PublishedSlugs() ([]string, error) {
-	rows, e := s.DB.Query("SELECT slug FROM posts WHERE status='published' ORDER BY published_at DESC")
+	rows, e := s.DB.Query("SELECT slug,keywords FROM posts WHERE status='published' AND is_visible=1 ORDER BY published_at DESC")
 	if e != nil {
 		return nil, e
 	}
 	defer rows.Close()
 	var v []string
 	for rows.Next() {
-		var x string
-		rows.Scan(&x)
-		v = append(v, x)
+		var slug, keywords string
+		if err := rows.Scan(&slug, &keywords); err != nil {
+			return nil, err
+		}
+		v = append(v, PublicPostPath(Post{Slug: slug, Keywords: keywords}))
 	}
 	sort.Strings(v)
 	return v, rows.Err()

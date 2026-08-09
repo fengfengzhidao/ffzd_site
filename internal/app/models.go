@@ -3,13 +3,14 @@ package app
 import "time"
 
 type Post struct {
-	ID                                           int64
-	Title, Slug, Summary, Markdown, HTML, Status string
-	CategoryID                                   *int64
-	CategoryName, CategorySlug                   string
-	Tags                                         []Tag
-	PublishedAt                                  *time.Time
-	CreatedAt, UpdatedAt                         time.Time
+	ID                                                     int64
+	Title, Slug, Summary, Keywords, Markdown, HTML, Status string
+	IsVisible                                              bool
+	CategoryID                                             *int64
+	CategoryName, CategorySlug                             string
+	Tags                                                   []Tag
+	PublishedAt                                            *time.Time
+	CreatedAt, UpdatedAt                                   time.Time
 }
 
 type Category struct {
@@ -37,4 +38,4 @@ type Settings struct {
 	PostsPerPage                                                                        int
 }
 
-type DashboardStats struct{ Total, Drafts, Published int }
+type DashboardStats struct{ Total, Hidden, Visible int }

@@ -28,3 +28,31 @@ func TestSlugifyAndUniqueSlug(t *testing.T) {
 		t.Fatalf("unexpected unique slug: %q", got)
 	}
 }
+
+func TestKeywordSlug(t *testing.T) {
+	if got := KeywordSlug("gpt-5.6, Codex"); got != "gpt5.6" {
+		t.Fatalf("unexpected keyword slug: %q", got)
+	}
+	if got := KeywordSlug("gpt-5.6，Codex"); got != "gpt5.6" {
+		t.Fatalf("unexpected Chinese-separated keyword slug: %q", got)
+	}
+	if got := UniqueKeywordSlug("gpt5.6", func(v string) bool { return v == "gpt5.6" }); got != "gpt5.6-2" {
+		t.Fatalf("unexpected unique keyword slug: %q", got)
+	}
+	if got := PublicPostPath(Post{Slug: "old-title", Keywords: "gpt-5.6"}); got != "gpt5.6" {
+		t.Fatalf("legacy post path did not use keyword: %q", got)
+	}
+	if got := PublicPostPath(Post{Slug: "gpt5.6-2", Keywords: "gpt-5.6"}); got != "gpt5.6-2" {
+		t.Fatalf("unique keyword suffix was lost: %q", got)
+	}
+}
+
+func TestPlainTextSummary(t *testing.T) {
+	rendered := "<h1>标题</h1><p>第一段 &amp; 第二段</p><pre><code>代码</code></pre>"
+	if got := PlainTextSummary(rendered, 10); got != "标题 第一段 & 第" {
+		t.Fatalf("unexpected summary: %q", got)
+	}
+	if got := PlainTextSummary("<p>短正文</p>", 60); got != "短正文" {
+		t.Fatalf("short summary changed: %q", got)
+	}
+}

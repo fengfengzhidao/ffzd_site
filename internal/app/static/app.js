@@ -63,6 +63,96 @@
     });
   });
 
+  const composerLayer = document.querySelector('[data-composer-layer]');
+  const infoLayer = composerLayer?.querySelector('[data-info-layer]');
+  const openComposer = () => {
+    if (!composerLayer) return;
+    composerLayer.classList.add('is-open');
+    composerLayer.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('composer-open');
+    window.setTimeout(() => composerLayer.querySelector('#markdown-input')?.focus(), 180);
+  };
+  const openInfo = () => {
+    if (!infoLayer) return;
+    infoLayer.classList.add('is-open');
+    infoLayer.setAttribute('aria-hidden', 'false');
+    window.setTimeout(() => infoLayer.querySelector('input[name="title"]')?.focus(), 80);
+  };
+  const closeInfo = () => {
+    if (!infoLayer) return;
+    infoLayer.classList.remove('is-open');
+    infoLayer.setAttribute('aria-hidden', 'true');
+  };
+  const closeComposer = () => {
+    if (!composerLayer) return;
+    closeInfo();
+    composerLayer.classList.remove('is-open');
+    composerLayer.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('composer-open');
+    if (new URLSearchParams(window.location.search).has('compose')) history.replaceState({}, '', '/admin/posts');
+  };
+  document.querySelector('[data-composer-open]')?.addEventListener('click', openComposer);
+  composerLayer?.querySelectorAll('[data-composer-close]').forEach((button) => button.addEventListener('click', closeComposer));
+  composerLayer?.querySelector('[data-info-open]')?.addEventListener('click', openInfo);
+  infoLayer?.querySelectorAll('[data-info-close]').forEach((button) => button.addEventListener('click', closeInfo));
+  infoLayer?.querySelector('[data-info-save]')?.addEventListener('click', () => {
+    const title = infoLayer.querySelector('input[name="title"]');
+    const error = infoLayer.querySelector('[data-info-error]');
+    if (!title?.value.trim()) { error.hidden = false; title?.focus(); return; }
+    error.hidden = true;
+    closeInfo();
+  });
+  if (composerLayer?.classList.contains('is-open')) document.body.classList.add('composer-open');
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    if (infoLayer?.classList.contains('is-open')) closeInfo();
+    else if (composerLayer?.classList.contains('is-open')) closeComposer();
+  });
+
+  document.querySelectorAll('[data-tag-combobox]').forEach((box) => {
+    const input = box.querySelector('[data-tag-input]');
+    const hidden = box.querySelector('[data-tag-hidden]');
+    const values = box.querySelector('[data-tag-values]');
+    let tags = (box.dataset.initialTags || '').split(/[,，]/).map((value) => value.trim()).filter(Boolean);
+    const sync = () => {
+      hidden.value = tags.join(', ');
+      values.replaceChildren(...tags.map((tag) => {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'tag-value';
+        chip.textContent = `${tag} ×`;
+        chip.setAttribute('aria-label', `移除标签 ${tag}`);
+        chip.addEventListener('click', () => { tags = tags.filter((value) => value !== tag); sync(); input.focus(); });
+        return chip;
+      }));
+    };
+    const add = () => {
+      const tag = input.value.trim().replace(/[,，]$/, '').trim();
+      if (tag && !tags.some((value) => value.toLocaleLowerCase() === tag.toLocaleLowerCase())) tags.push(tag);
+      input.value = '';
+      sync();
+    };
+    input?.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ',' || event.key === '，') { event.preventDefault(); add(); }
+      if (event.key === 'Backspace' && !input.value && tags.length) { tags.pop(); sync(); }
+    });
+    input?.addEventListener('change', add);
+    box.closest('form')?.addEventListener('submit', add);
+    sync();
+  });
+
+  const postForm = document.querySelector('#post-form');
+  postForm?.addEventListener('submit', (event) => {
+    const title = postForm.querySelector('input[name="title"]');
+    const error = postForm.querySelector('[data-info-error]');
+    if (!title?.value.trim()) {
+      event.preventDefault();
+      openInfo();
+      error.hidden = false;
+      title?.focus();
+    }
+  });
+
   const input = document.querySelector('#markdown-input');
   const preview = document.querySelector('#markdown-preview');
   if (!input || !preview) return;
@@ -75,6 +165,22 @@
     } catch (_) { preview.innerHTML = '<p>预览暂不可用</p>'; }
   };
   input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(render, 250); });
+  const count = document.querySelector('[data-editor-count]');
+  const syncCount = () => { if (count) count.textContent = `字数：${Array.from(input.value.trim()).length}`; };
+  input.addEventListener('input', syncCount);
+  syncCount();
+
+  const insertMarkdown = (before, after = before, placeholder = '文本') => {
+    const start = input.selectionStart;
+    const end = input.selectionEnd;
+    const selected = input.value.slice(start, end) || placeholder;
+    input.setRangeText(`${before}${selected}${after}`, start, end, 'end');
+    input.focus();
+    input.dispatchEvent(new Event('input'));
+  };
+  document.querySelectorAll('[data-md-wrap]').forEach((button) => button.addEventListener('click', () => insertMarkdown(button.dataset.mdWrap)));
+  document.querySelectorAll('[data-md-prefix]').forEach((button) => button.addEventListener('click', () => insertMarkdown(button.dataset.mdPrefix, '', '')));
+  document.querySelector('[data-md-link]')?.addEventListener('click', () => insertMarkdown('[', '](https://)', '链接文字'));
   render();
 
   const upload = document.querySelector('#image-upload');

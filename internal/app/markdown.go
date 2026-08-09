@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"fmt"
+	stdhtml "html"
 	"regexp"
 	"strings"
 	"unicode"
@@ -31,6 +32,20 @@ func (r *MarkdownRenderer) Render(source string) (string, error) {
 }
 
 var multiDash = regexp.MustCompile(`-+`)
+var htmlTag = regexp.MustCompile(`<[^>]+>`)
+
+func PlainTextSummary(rendered string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	text := stdhtml.UnescapeString(htmlTag.ReplaceAllString(rendered, " "))
+	text = strings.Join(strings.Fields(text), " ")
+	runes := []rune(text)
+	if len(runes) > limit {
+		runes = runes[:limit]
+	}
+	return string(runes)
+}
 
 func Slugify(s string) string {
 	s = strings.TrimSpace(strings.ToLower(s))
@@ -48,6 +63,54 @@ func Slugify(s string) string {
 		}
 	}
 	return strings.Trim(multiDash.ReplaceAllString(b.String(), "-"), "-")
+}
+
+// KeywordSlug returns the URL-safe form of the first article keyword. Hyphens
+// and whitespace are intentionally removed so a keyword such as "gpt-5.6"
+// is reachable at /posts/gpt5.6, while dots remain meaningful version markers.
+func KeywordSlug(keywords string) string {
+	first := strings.FieldsFunc(keywords, func(r rune) bool {
+		return r == ',' || r == '，' || r == ';' || r == '；' || r == '\n' || r == '\r'
+	})
+	if len(first) == 0 {
+		return ""
+	}
+	keyword := strings.TrimSpace(strings.ToLower(first[0]))
+	var b strings.Builder
+	for _, r := range keyword {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '.' {
+			b.WriteRune(r)
+		}
+	}
+	return strings.Trim(b.String(), ".")
+}
+
+// PublicPostPath keeps keyword-based paths for older articles while preserving
+// a stored numeric suffix when two articles share the same first keyword.
+func PublicPostPath(p Post) string {
+	keywordPath := KeywordSlug(p.Keywords)
+	if keywordPath == "" {
+		return p.Slug
+	}
+	if p.Slug == keywordPath || strings.HasPrefix(p.Slug, keywordPath+"-") {
+		return p.Slug
+	}
+	return keywordPath
+}
+
+func UniqueKeywordSlug(base string, exists func(string) bool) string {
+	if base == "" {
+		return ""
+	}
+	if !exists(base) {
+		return base
+	}
+	for i := 2; ; i++ {
+		candidate := fmt.Sprintf("%s-%d", base, i)
+		if !exists(candidate) {
+			return candidate
+		}
+	}
 }
 
 func UniqueSlug(base string, exists func(string) bool) string {
