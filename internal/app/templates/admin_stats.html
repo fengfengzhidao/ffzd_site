@@ -1,0 +1,32 @@
+{{define "admin_stats.html"}}{{template "head" .}}
+<div class="admin-layout" data-admin-layout>
+  {{template "admin_sidebar" .}}
+  <div class="admin-workspace">
+    {{template "admin_topbar" .}}
+    <main class="container admin-page analytics-page">
+      <header class="section-head"><div><p class="eyebrow">访问概览</p><h1>数据统计</h1></div><p class="muted">按中国标准时间（UTC+8）统计</p></header>
+      <section class="analytics-summary" aria-label="网站浏览量摘要">
+        <div class="panel"><span>累计浏览</span><strong>{{.Analytics.Summary.Total}}</strong></div>
+        <div class="panel"><span>今日浏览</span><strong>{{.Analytics.Summary.Today}}</strong></div>
+        <div class="panel"><span>近 7 天</span><strong>{{.Analytics.Summary.Last7}}</strong></div>
+        <div class="panel"><span>近 30 天</span><strong>{{.Analytics.Summary.Last30}}</strong></div>
+      </section>
+      <section class="panel analytics-chart-panel">
+        <header class="section-head"><div><p class="eyebrow">趋势</p><h2>近 30 天全站浏览量</h2></div></header>
+        <div class="analytics-chart" role="img" aria-label="近 30 天全站每日浏览量柱状图">
+          {{range .Analytics.Daily}}<div class="analytics-bar-column" tabindex="0" style="--bar-height:{{.Percent}}%" data-tooltip="{{.Date}} · {{.Count}} 次浏览" aria-label="{{.Date}}，{{.Count}} 次浏览">{{if .Count}}<span class="analytics-bar-value">{{.Count}}</span>{{end}}<i class="analytics-bar"></i><time datetime="{{.Date}}">{{.Label}}</time></div>{{end}}
+        </div>
+      </section>
+      <section class="panel analytics-table-panel">
+        <header class="section-head"><div><p class="eyebrow">内容</p><h2>文章浏览排行</h2></div></header>
+        {{if .Analytics.Posts}}<div class="table-wrap"><table class="analytics-table"><thead><tr><th>文章</th><th>状态</th><th>今日</th><th>近 7 天</th><th>累计</th></tr></thead><tbody>{{range .Analytics.Posts}}<tr><td><a href="/admin/posts?compose={{.ID}}">{{.Title}}</a></td><td><span class="status {{.Status}}">{{if eq .Status "draft"}}草稿{{else if .IsVisible}}已发布{{else}}已隐藏{{end}}</span></td><td>{{.Today}}</td><td>{{.Last7}}</td><td><strong>{{.Total}}</strong></td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty">暂无文章。</div>{{end}}
+      </section>
+      <section class="panel analytics-table-panel">
+        <header class="section-head"><div><p class="eyebrow">合集</p><h2>专题浏览排行</h2></div></header>
+        {{if .Analytics.Topics}}<div class="table-wrap"><table class="analytics-table"><thead><tr><th>专题</th><th>文章数</th><th>今日</th><th>近 7 天</th><th>累计</th></tr></thead><tbody>{{range .Analytics.Topics}}<tr><td><a href="/admin/topics#topic-{{.ID}}">{{.Name}}</a></td><td>{{.DocumentCount}}</td><td>{{.Today}}</td><td>{{.Last7}}</td><td><strong>{{.Total}}</strong></td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty">暂无专题。</div>{{end}}
+      </section>
+    </main>
+  </div>
+  {{template "admin_overlay" .}}
+</div>
+<script src="/static/app.js" defer></script></body></html>{{end}}

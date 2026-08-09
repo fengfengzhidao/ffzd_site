@@ -200,7 +200,7 @@ func scanPost(row interface{ Scan(...any) error }) (Post, error) {
 	var coverURL sql.NullString
 	var pub sql.NullTime
 	var visible int
-	err := row.Scan(&p.ID, &p.Title, &p.Slug, &p.Summary, &p.Keywords, &p.Markdown, &p.HTML, &p.Status, &visible, &catID, &catName, &catSlug, &coverID, &coverURL, &pub, &p.CreatedAt, &p.UpdatedAt)
+	err := row.Scan(&p.ID, &p.Title, &p.Slug, &p.Summary, &p.Keywords, &p.Markdown, &p.HTML, &p.Status, &visible, &catID, &catName, &catSlug, &coverID, &coverURL, &p.ViewCount, &pub, &p.CreatedAt, &p.UpdatedAt)
 	p.IsVisible = visible == 1
 	if catID.Valid {
 		p.CategoryID = &catID.Int64
@@ -217,7 +217,7 @@ func scanPost(row interface{ Scan(...any) error }) (Post, error) {
 	return p, err
 }
 
-const postSelect = `SELECT p.id,p.title,p.slug,p.summary,p.keywords,p.markdown,p.html,p.status,p.is_visible,p.category_id,c.name,c.slug,p.cover_id,cv.url,p.published_at,p.created_at,p.updated_at FROM posts p LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN covers cv ON cv.id=p.cover_id`
+const postSelect = `SELECT p.id,p.title,p.slug,p.summary,p.keywords,p.markdown,p.html,p.status,p.is_visible,p.category_id,c.name,c.slug,p.cover_id,cv.url,p.view_count,p.published_at,p.created_at,p.updated_at FROM posts p LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN covers cv ON cv.id=p.cover_id`
 
 func (s *Store) PostByID(id int64) (Post, error) {
 	p, e := scanPost(s.DB.QueryRow(postSelect+" WHERE p.id=?", id))
@@ -623,7 +623,7 @@ func scanTopic(row interface{ Scan(...any) error }) (Topic, error) {
 	var value Topic
 	var coverID sql.NullInt64
 	var coverURL sql.NullString
-	err := row.Scan(&value.ID, &value.Name, &value.Slug, &coverID, &coverURL, &value.DocumentCount, &value.CreatedAt, &value.UpdatedAt)
+	err := row.Scan(&value.ID, &value.Name, &value.Slug, &coverID, &coverURL, &value.DocumentCount, &value.ViewCount, &value.CreatedAt, &value.UpdatedAt)
 	if coverID.Valid {
 		value.CoverID = &coverID.Int64
 	}
@@ -633,6 +633,7 @@ func scanTopic(row interface{ Scan(...any) error }) (Topic, error) {
 
 const topicSelect = `SELECT t.id,t.name,t.slug,t.cover_id,c.url,
  (SELECT COUNT(*) FROM topic_nodes n WHERE n.topic_id=t.id AND n.post_id IS NOT NULL),
+ (SELECT COALESCE(SUM(p.view_count),0) FROM posts p JOIN (SELECT DISTINCT post_id FROM topic_nodes WHERE topic_id=t.id AND post_id IS NOT NULL) n ON n.post_id=p.id),
  t.created_at,t.updated_at FROM topics t LEFT JOIN covers c ON c.id=t.cover_id`
 
 func (s *Store) Topics() ([]Topic, error) {
@@ -655,6 +656,7 @@ func (s *Store) Topics() ([]Topic, error) {
 func (s *Store) PublicTopics() ([]Topic, error) {
 	query := `SELECT t.id,t.name,t.slug,t.cover_id,c.url,
  (SELECT COUNT(*) FROM topic_nodes n JOIN posts p ON p.id=n.post_id WHERE n.topic_id=t.id AND p.status='published' AND p.is_visible=1),
+ (SELECT COALESCE(SUM(p.view_count),0) FROM posts p JOIN (SELECT DISTINCT post_id FROM topic_nodes WHERE topic_id=t.id AND post_id IS NOT NULL) n ON n.post_id=p.id),
  t.created_at,t.updated_at FROM topics t LEFT JOIN covers c ON c.id=t.cover_id ORDER BY t.updated_at DESC,t.id DESC`
 	rows, err := s.DB.Query(query)
 	if err != nil {
@@ -1036,6 +1038,152 @@ func (s *Store) Stats() (DashboardStats, error) {
 	e := s.DB.QueryRow(`SELECT COUNT(*),COALESCE(SUM(CASE WHEN is_visible=0 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN is_visible=1 THEN 1 ELSE 0 END),0) FROM posts`).Scan(&v.Total, &v.Hidden, &v.Visible)
 	return v, e
 }
+
+var analyticsLocation = time.FixedZone("UTC+8", 8*60*60)
+
+func analyticsDate(at time.Time) string {
+	return at.In(analyticsLocation).Format("2006-01-02")
+}
+
+// RecordPageView records one successful public HTML page view. When postID is
+// present, the site and article counters are updated in the same transaction.
+func (s *Store) RecordPageView(postID *int64, at time.Time) error {
+	date := analyticsDate(at)
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec("UPDATE site_view_totals SET view_count=view_count+1 WHERE id=1"); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO site_daily_views(view_date,view_count) VALUES(?,1)
+ ON CONFLICT(view_date) DO UPDATE SET view_count=view_count+1`, date); err != nil {
+		return err
+	}
+	if postID != nil {
+		result, updateErr := tx.Exec("UPDATE posts SET view_count=view_count+1 WHERE id=?", *postID)
+		if updateErr != nil {
+			return updateErr
+		}
+		changed, updateErr := result.RowsAffected()
+		if updateErr != nil {
+			return updateErr
+		}
+		if changed == 0 {
+			return sql.ErrNoRows
+		}
+		if _, err = tx.Exec(`INSERT INTO post_daily_views(post_id,view_date,view_count) VALUES(?,?,1)
+ ON CONFLICT(post_id,view_date) DO UPDATE SET view_count=view_count+1`, *postID, date); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) AnalyticsStats(now time.Time) (AnalyticsStats, error) {
+	var result AnalyticsStats
+	todayTime := now.In(analyticsLocation)
+	today := todayTime.Format("2006-01-02")
+	last7 := todayTime.AddDate(0, 0, -6).Format("2006-01-02")
+	last30 := todayTime.AddDate(0, 0, -29).Format("2006-01-02")
+
+	if err := s.DB.QueryRow(`SELECT
+ (SELECT view_count FROM site_view_totals WHERE id=1),
+ COALESCE(SUM(CASE WHEN view_date=? THEN view_count ELSE 0 END),0),
+ COALESCE(SUM(CASE WHEN view_date>=? AND view_date<=? THEN view_count ELSE 0 END),0),
+ COALESCE(SUM(CASE WHEN view_date>=? AND view_date<=? THEN view_count ELSE 0 END),0)
+ FROM site_daily_views`, today, last7, today, last30, today).Scan(&result.Summary.Total, &result.Summary.Today, &result.Summary.Last7, &result.Summary.Last30); err != nil {
+		return result, err
+	}
+
+	dailyCounts := make(map[string]int64, 30)
+	rows, err := s.DB.Query("SELECT view_date,view_count FROM site_daily_views WHERE view_date>=? AND view_date<=?", last30, today)
+	if err != nil {
+		return result, err
+	}
+	for rows.Next() {
+		var date string
+		var count int64
+		if err = rows.Scan(&date, &count); err != nil {
+			rows.Close()
+			return result, err
+		}
+		dailyCounts[date] = count
+	}
+	if err = rows.Close(); err != nil {
+		return result, err
+	}
+	var maxCount int64
+	for day := -29; day <= 0; day++ {
+		dateTime := todayTime.AddDate(0, 0, day)
+		date := dateTime.Format("2006-01-02")
+		count := dailyCounts[date]
+		if count > maxCount {
+			maxCount = count
+		}
+		result.Daily = append(result.Daily, DailyView{Date: date, Label: dateTime.Format("01-02"), Count: count})
+	}
+	for i := range result.Daily {
+		if maxCount > 0 && result.Daily[i].Count > 0 {
+			result.Daily[i].Percent = int(result.Daily[i].Count * 100 / maxCount)
+			if result.Daily[i].Percent < 3 {
+				result.Daily[i].Percent = 3
+			}
+		}
+	}
+
+	postRows, err := s.DB.Query(`SELECT p.id,p.title,p.status,p.is_visible,
+ COALESCE(SUM(CASE WHEN d.view_date=? THEN d.view_count ELSE 0 END),0),
+ COALESCE(SUM(CASE WHEN d.view_date>=? AND d.view_date<=? THEN d.view_count ELSE 0 END),0),p.view_count
+ FROM posts p LEFT JOIN post_daily_views d ON d.post_id=p.id
+ GROUP BY p.id ORDER BY p.view_count DESC,p.id DESC`, today, last7, today)
+	if err != nil {
+		return result, err
+	}
+	for postRows.Next() {
+		var value PostViewStats
+		var visible int
+		if err = postRows.Scan(&value.ID, &value.Title, &value.Status, &visible, &value.Today, &value.Last7, &value.Total); err != nil {
+			postRows.Close()
+			return result, err
+		}
+		value.IsVisible = visible == 1
+		result.Posts = append(result.Posts, value)
+	}
+	if err = postRows.Close(); err != nil {
+		return result, err
+	}
+
+	topicRows, err := s.DB.Query(`WITH topic_posts AS (
+ SELECT DISTINCT topic_id,post_id FROM topic_nodes WHERE post_id IS NOT NULL
+), post_ranges AS (
+ SELECT post_id,
+  SUM(CASE WHEN view_date=? THEN view_count ELSE 0 END) AS today_views,
+  SUM(CASE WHEN view_date>=? AND view_date<=? THEN view_count ELSE 0 END) AS last7_views
+ FROM post_daily_views GROUP BY post_id
+)
+ SELECT t.id,t.name,COUNT(tp.post_id),COALESCE(SUM(pr.today_views),0),
+ COALESCE(SUM(pr.last7_views),0),COALESCE(SUM(p.view_count),0) AS total_views
+ FROM topics t
+ LEFT JOIN topic_posts tp ON tp.topic_id=t.id
+ LEFT JOIN posts p ON p.id=tp.post_id
+ LEFT JOIN post_ranges pr ON pr.post_id=tp.post_id
+ GROUP BY t.id ORDER BY total_views DESC,t.id DESC`, today, last7, today)
+	if err != nil {
+		return result, err
+	}
+	defer topicRows.Close()
+	for topicRows.Next() {
+		var value TopicViewStats
+		if err = topicRows.Scan(&value.ID, &value.Name, &value.DocumentCount, &value.Today, &value.Last7, &value.Total); err != nil {
+			return result, err
+		}
+		result.Topics = append(result.Topics, value)
+	}
+	return result, topicRows.Err()
+}
+
 func (s *Store) PublishedSlugs() ([]string, error) {
 	rows, e := s.DB.Query("SELECT slug,keywords FROM posts WHERE status='published' AND is_visible=1 ORDER BY published_at DESC")
 	if e != nil {

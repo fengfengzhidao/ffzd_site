@@ -59,6 +59,7 @@ type viewData struct {
 	TopicNodes                                                    []TopicNode
 	ActiveTopicNode                                               *TopicNode
 	Stats                                                         DashboardStats
+	Analytics                                                     AnalyticsStats
 	Page, TotalPages, Total                                       int
 	Query, ActiveTag                                              string
 	Now                                                           time.Time
@@ -204,6 +205,7 @@ func (a *App) routes() http.Handler {
 			r.Post("/topics/{id}/delete", a.deleteTopic)
 			r.Post("/topics/{id}/nodes", a.saveTopicNode)
 			r.Post("/topics/{id}/nodes/{nodeID}/delete", a.deleteTopicNode)
+			r.Get("/stats", a.adminStats)
 			r.Get("/feedback", a.adminFeedback)
 			r.Post("/feedback/{id}/read", a.setFeedbackRead)
 			r.Post("/feedback/{id}/delete", a.deleteFeedback)
@@ -274,6 +276,7 @@ func (a *App) home(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("feedback") == "saved" {
 		d.Flash = "感谢反馈，我们已经收到。"
 	}
+	a.recordPageView(nil)
 	a.render(w, r, "home.html", d, 200)
 }
 
@@ -373,7 +376,11 @@ func (a *App) tagPosts(w http.ResponseWriter, r *http.Request) {
 func (a *App) renderPostList(w http.ResponseWriter, r *http.Request, kind, slug string) {
 	d := a.baseData(r, "文章", "浏览全部已发布文章")
 	p := pageOf(r)
-	posts, total, _ := a.store.ListPosts(r.Context(), true, kind, slug, p, d.Settings.PostsPerPage)
+	posts, total, err := a.store.ListPosts(r.Context(), true, kind, slug, p, d.Settings.PostsPerPage)
+	if err != nil {
+		http.Error(w, "文章加载失败", http.StatusInternalServerError)
+		return
+	}
 	d.Posts = posts
 	d.Page = p
 	d.TotalPages = pages(total, d.Settings.PostsPerPage)
@@ -384,8 +391,24 @@ func (a *App) renderPostList(w http.ResponseWriter, r *http.Request, kind, slug 
 		a.notFound(w, r)
 		return
 	}
+	a.recordPageView(nil)
 	a.render(w, r, "posts.html", d, 200)
 }
+
+func (a *App) recordPageView(post *Post) {
+	var postID *int64
+	if post != nil {
+		postID = &post.ID
+	}
+	if err := a.store.RecordPageView(postID, time.Now()); err != nil {
+		log.Printf("record page view: %v", err)
+		return
+	}
+	if post != nil {
+		post.ViewCount++
+	}
+}
+
 func (a *App) postDetail(w http.ResponseWriter, r *http.Request) {
 	p, err := a.store.PublishedByPath(chi.URLParam(r, "slug"))
 	if err != nil {
@@ -400,12 +423,14 @@ func (a *App) postDetail(w http.ResponseWriter, r *http.Request) {
 	d.Post = &p
 	payload, _ := json.Marshal(map[string]any{"@context": "https://schema.org", "@type": "BlogPosting", "headline": p.Title, "description": desc, "keywords": p.Keywords, "datePublished": p.PublishedAt, "dateModified": p.UpdatedAt, "author": map[string]string{"@type": "Person", "name": d.Settings.Author}})
 	d.JSONLD = template.JS(payload)
+	a.recordPageView(&p)
 	a.render(w, r, "post.html", d, 200)
 }
 
 func (a *App) topics(w http.ResponseWriter, r *http.Request) {
 	d := a.baseData(r, "专题", "按专题系统阅读系列文章")
 	d.Topics, _ = a.store.PublicTopics()
+	a.recordPageView(nil)
 	a.render(w, r, "topics.html", d, http.StatusOK)
 }
 
@@ -442,6 +467,10 @@ func (a *App) topicDetail(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		active.Post = &post
+		a.recordPageView(active.Post)
+		topic.ViewCount++
+	} else {
+		a.recordPageView(nil)
 	}
 	desc := "专题：" + topic.Name
 	d := a.baseData(r, topic.Name, desc)
@@ -586,6 +615,18 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	d.Posts, _, _ = a.store.ListPosts(r.Context(), false, "", "", 1, 5)
 	a.render(w, r, "dashboard.html", d, 200)
 }
+
+func (a *App) adminStats(w http.ResponseWriter, r *http.Request) {
+	d := a.baseData(r, "数据统计", "")
+	stats, err := a.store.AnalyticsStats(time.Now())
+	if err != nil {
+		http.Error(w, "统计数据加载失败", http.StatusInternalServerError)
+		return
+	}
+	d.Analytics = stats
+	a.render(w, r, "admin_stats.html", d, http.StatusOK)
+}
+
 func (a *App) adminPosts(w http.ResponseWriter, r *http.Request) {
 	d := a.baseData(r, "文章管理", "")
 	d.Posts, _, _ = a.store.ListPosts(r.Context(), false, "", "", 1, 100)

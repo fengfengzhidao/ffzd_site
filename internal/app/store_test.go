@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -44,8 +45,103 @@ func TestStoreAdminSessionAndMigration(t *testing.T) {
 		t.Fatalf("deleted session remains: %v", err)
 	}
 	var versions int
-	if err = s.DB.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 7 {
+	if err = s.DB.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 8 {
 		t.Fatalf("migration tracking failed: %d %v", versions, err)
+	}
+}
+
+func TestAnalyticsRecordingAndTopicAggregation(t *testing.T) {
+	s := newTestStore(t)
+	post := &Post{Title: "统计文章", Slug: "analytics-post", Markdown: "正文", HTML: "<p>正文</p>", Status: "published", IsVisible: true}
+	if err := s.SavePost(post, nil); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := s.PostByID(post.ID)
+	if err != nil || stored.ViewCount != 0 {
+		t.Fatalf("new post view count = %d, %v", stored.ViewCount, err)
+	}
+
+	first := &Topic{Name: "统计专题一", Slug: "analytics-topic-one"}
+	second := &Topic{Name: "统计专题二", Slug: "analytics-topic-two"}
+	if err = s.SaveTopic(first); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SaveTopic(second); err != nil {
+		t.Fatal(err)
+	}
+	firstNode := &TopicNode{TopicID: first.ID, PostID: &post.ID, Title: "文章节点一"}
+	duplicateNode := &TopicNode{TopicID: first.ID, PostID: &post.ID, Title: "重复文章节点"}
+	secondNode := &TopicNode{TopicID: second.ID, PostID: &post.ID, Title: "跨专题节点"}
+	for _, node := range []*TopicNode{firstNode, duplicateNode, secondNode} {
+		if err = s.SaveTopicNode(node); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	china := time.FixedZone("test UTC+8", 8*60*60)
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, china)
+	old := now.AddDate(0, 0, -8)
+	if err = s.RecordPageView(&post.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.RecordPageView(&post.ID, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.RecordPageView(&post.ID, old); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.RecordPageView(nil, now); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := s.AnalyticsStats(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Summary.Total != 4 || stats.Summary.Today != 3 || stats.Summary.Last7 != 3 || stats.Summary.Last30 != 4 {
+		t.Fatalf("site summary mismatch: %#v", stats.Summary)
+	}
+	if len(stats.Daily) != 30 || stats.Daily[29].Date != "2026-08-09" || stats.Daily[29].Count != 3 || stats.Daily[0].Count != 0 {
+		t.Fatalf("daily series mismatch: %#v", stats.Daily)
+	}
+	if len(stats.Posts) != 1 || stats.Posts[0].Total != 3 || stats.Posts[0].Today != 2 || stats.Posts[0].Last7 != 2 {
+		t.Fatalf("post stats mismatch: %#v", stats.Posts)
+	}
+	if len(stats.Topics) != 2 {
+		t.Fatalf("topic stats missing: %#v", stats.Topics)
+	}
+	for _, topic := range stats.Topics {
+		if topic.DocumentCount != 1 || topic.Total != 3 || topic.Today != 2 || topic.Last7 != 2 {
+			t.Fatalf("topic aggregation did not deduplicate posts: %#v", topic)
+		}
+	}
+	publicTopics, err := s.PublicTopics()
+	if err != nil || len(publicTopics) != 2 || publicTopics[0].ViewCount != 3 || publicTopics[1].ViewCount != 3 {
+		t.Fatalf("public topic views mismatch: %#v %v", publicTopics, err)
+	}
+	if err = s.SetPostVisibility(post.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	publicTopics, err = s.PublicTopics()
+	if err != nil || len(publicTopics) != 2 || publicTopics[0].DocumentCount != 0 || publicTopics[0].ViewCount != 3 {
+		t.Fatalf("hidden post history should remain in topic views: %#v %v", publicTopics, err)
+	}
+	if err = s.DeleteTopicNode(first.ID, duplicateNode.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.DeleteTopicNode(first.ID, firstNode.ID); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = s.AnalyticsStats(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicTotals := map[int64]int64{}
+	for _, topic := range stats.Topics {
+		topicTotals[topic.ID] = topic.Total
+	}
+	if topicTotals[first.ID] != 0 || topicTotals[second.ID] != 3 {
+		t.Fatalf("topic association changes were not reflected: %#v", topicTotals)
 	}
 }
 

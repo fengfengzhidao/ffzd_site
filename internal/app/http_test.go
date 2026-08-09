@@ -171,6 +171,81 @@ func TestTopicAdminAndPublicReadingRoutes(t *testing.T) {
 	}
 }
 
+func TestPageViewCountingAndAnalyticsPage(t *testing.T) {
+	a := newTestApp(t)
+	if err := a.store.SaveTaxonomy("category", 0, "Go", "go"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.store.SaveTaxonomy("tag", 0, "统计", "stats"); err != nil {
+		t.Fatal(err)
+	}
+	categories, _ := a.store.Categories()
+	tags, _ := a.store.Tags()
+	post := &Post{Title: "浏览量文章", Slug: "view-count-post", Markdown: "正文", HTML: "<p>正文</p>", Status: "published", IsVisible: true, CategoryID: &categories[0].ID}
+	if err := a.store.SavePost(post, []int64{tags[0].ID}); err != nil {
+		t.Fatal(err)
+	}
+	topic := &Topic{Name: "浏览量专题", Slug: "view-count-topic"}
+	if err := a.store.SaveTopic(topic); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.store.SaveTopicNode(&TopicNode{TopicID: topic.ID, PostID: &post.ID, Title: "统计正文"}); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := a.server.Handler
+	for _, path := range []string{"/", "/posts", "/categories/go", "/tags/stats"} {
+		if response := perform(handler, http.MethodGet, path, nil); response.Code != http.StatusOK {
+			t.Fatalf("counted page %s status = %d", path, response.Code)
+		}
+	}
+	if response := perform(handler, http.MethodGet, "/home/posts", nil); response.Code != http.StatusOK {
+		t.Fatalf("home fragment status = %d", response.Code)
+	}
+	article := perform(handler, http.MethodGet, "/posts/view-count-post", nil)
+	if article.Code != http.StatusOK || !strings.Contains(article.Body.String(), "1 次浏览") {
+		t.Fatalf("article view count missing: %d %s", article.Code, article.Body.String())
+	}
+	if response := perform(handler, http.MethodGet, "/topics", nil); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "1 次浏览") {
+		t.Fatalf("topic list view count missing: %d %s", response.Code, response.Body.String())
+	}
+	topicPage := perform(handler, http.MethodGet, "/topics/view-count-topic", nil)
+	if topicPage.Code != http.StatusOK || !strings.Contains(topicPage.Body.String(), "专题 2 次浏览") {
+		t.Fatalf("topic reader view count missing: %d %s", topicPage.Code, topicPage.Body.String())
+	}
+	for _, path := range []string{"/missing-page", "/sitemap.xml", "/robots.txt", "/static/style.css", "/admin/stats"} {
+		_ = perform(handler, http.MethodGet, path, nil)
+	}
+
+	admin, _ := a.store.Authenticate("admin", "very-strong-password")
+	token, _, err := a.store.CreateSession(admin.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statsPage := perform(handler, http.MethodGet, "/admin/stats", nil, &http.Cookie{Name: "session", Value: token})
+	for _, expected := range []string{
+		`class="admin-nav-link active" href="/admin/stats"`,
+		`<span>累计浏览</span><strong>7</strong>`,
+		"近 30 天全站浏览量",
+		"浏览量文章",
+		"浏览量专题",
+		`style="--bar-height:`,
+		`data-tooltip=`,
+		`aria-label=`,
+	} {
+		if statsPage.Code != http.StatusOK || !strings.Contains(statsPage.Body.String(), expected) {
+			t.Fatalf("analytics page missing %q: %d %s", expected, statsPage.Code, statsPage.Body.String())
+		}
+	}
+	if strings.Contains(statsPage.Body.String(), "ZgotmplZ") {
+		t.Fatal("analytics chart contains escaped unsafe CSS")
+	}
+	stored, err := a.store.PostByID(post.ID)
+	if err != nil || stored.ViewCount != 2 {
+		t.Fatalf("article counter = %d, %v", stored.ViewCount, err)
+	}
+}
+
 func TestLoginCSRFAndAuthenticatedDashboard(t *testing.T) {
 	a := newTestApp(t)
 	handler := a.server.Handler
